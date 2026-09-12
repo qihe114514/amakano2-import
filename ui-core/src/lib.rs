@@ -384,7 +384,7 @@ fn demo_logs() -> Vec<LogLine> {    let raw = [
         (LogLevel::Info, "INFO Amakano2 pack importer loaded"),
         (LogLevel::Info, "INFO chapter packs available count=15 version=\"0.2.1\""),
         (LogLevel::Info, "INFO connecting device addr=\"AA:BB:CC:DD:EE:FF\""),
-        (LogLevel::Info, "INFO launched watch app package=\"cn.example.amakano2.miband10\""),
+        (LogLevel::Info, "INFO launched watch app package=\"cn.amakanotwo.qihe\""),
         (LogLevel::Warn, "WARN probe timeout, retrying attempt=1"),
         (LogLevel::Info, "INFO handshake ok, installed packs=5"),
         (LogLevel::Info, "INFO begin pack=\"共通线 第五章·结缘\" files=25 bytes=890362"),

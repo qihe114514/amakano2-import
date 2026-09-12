@@ -70,7 +70,7 @@ mod logger;
 mod render;
 
 /// 手环上《甜蜜女友2》的包名（interconnect 收发都用它）。
-const PACKAGE_NAME: &str = "cn.example.amakano2.miband10";
+const PACKAGE_NAME: &str = "cn.amakanotwo.qihe";
 /// 章节包随插件一起分发：`packs/index.json` 是清单，`packs/*.pack` 是包体。
 const LIBRARY_DIR: &str = "packs";
 const LIBRARY_INDEX: &str = "index.json";
