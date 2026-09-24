@@ -8,8 +8,8 @@
 
 use super::super::actions;
 use super::super::glass::{
-    ghost_button, kv_grid, meta, panel, primary_button, progress_bar, section, state_badge,
-    stat_tile, status_pill, tile_row,
+    error_card, ghost_button, kv_grid, meta, panel, primary_button, progress_bar, section,
+    session_steps, state_badge, stat_tile, status_pill, tile_row,
 };
 use super::super::node::{Node, Tag, label};
 use super::super::snapshot::{ResumeView, Snapshot, StatusKind, TransferView};
@@ -20,7 +20,12 @@ use super::super::human_bytes;
 const QUEUE_NAMES: usize = 3;
 
 pub fn render(snapshot: &Snapshot) -> Node {
+    // 失败卡片排在最前：出事了就该先看见它，而不是先看见「接下来做什么」。
+    // 文案由码决定（`ErrorCode::label` / `advice`），这里只负责摆。
     let mut page = Node::new(Tag::Div).full().column().gap(GAP_LG).child(hero(snapshot));
+    if let Some(error) = snapshot.error.as_ref() {
+        page = page.child(error_card(error));
+    }
     if let Some(card) = in_progress(snapshot) {
         page = page.child(card);
     }
@@ -77,7 +82,9 @@ fn hero(snapshot: &Snapshot) -> Node {
         stat_tile(&snapshot.total_hours(), "小时", "总时长", TEXT_MAIN),
     ]);
 
-    panel(CARD_RADIUS).pad(CARD_PAD).gap(GAP).child(head).child(buttons).child(tiles)
+    // 连接进度就在主卡里，紧挨着两个主操作：**它回答的是「我刚才那一下点到哪一步了」**，
+    // 这正好是旧实现说不清的那件事（接了、握着、列表却没拿到）。
+    panel(CARD_RADIUS).pad(CARD_PAD).gap(GAP).child(head).child(buttons).child(session_steps(snapshot.stage)).child(tiles)
 }
 
 /// 进行中的事：正在传输，或者上次传到一半。两者互斥，所以共用一张卡。

@@ -13,8 +13,8 @@
 
 use super::super::actions;
 use super::super::glass::{
-    empty, ghost_button, hover_key, hovered, meta, panel, primary_button, quiet_button,
-    section_with_action, status_pill, title,
+    alpha, empty, ghost_button, hover_key, hovered, meta, panel, primary_button, quiet_button,
+    section_with_action, state_badge, status_pill, title,
 };
 use super::super::node::{Node, Tag, badge, label};
 use super::super::snapshot::{InstalledView, Snapshot, StatusKind};
@@ -29,7 +29,41 @@ pub fn render(snapshot: &Snapshot) -> Node {
         .column()
         .gap(GAP_LG)
         .child(link(snapshot))
+        .child(broken_notice(snapshot))
         .child(installed_list(snapshot))
+}
+
+/// 注册表里有、但 `pack.txt` 读不出来的章节。
+///
+/// **不许静默**：`scan` 现在只读、不再把读不出来的条目从注册表里剔掉（旧实现会，
+/// 一次瞬时读失败就把那一章**永久**丢掉，真机症状是「已安装章节列表缺章/全空、
+/// 重连也不好」）。剔不得，就必须说得出来 —— 否则用户看到的是一章的失踪，
+/// 而原因在日志里。
+fn broken_notice(snapshot: &Snapshot) -> Node {
+    if snapshot.installed_broken.is_empty() {
+        return Node::new(Tag::Div).full().column();
+    }
+    let names = snapshot.installed_broken.join("、");
+    let badge_text = format!("{} 条登记读不出来", snapshot.installed_broken.len());
+    Node::new(Tag::Div)
+        .full()
+        .column()
+        .gap(GAP_XS)
+        .pad(GAP)
+        .radius(ROW_RADIUS)
+        .bg(SURFACE_SOFT)
+        .border(1, &alpha(WARN, "55"))
+        .child(
+            Node::new(Tag::Div)
+                .full()
+                .row()
+                .align("center")
+                .gap(GAP_XS)
+                .child(state_badge(&badge_text, StatusKind::Warn))
+                .child(label("", SIZE_SMALL, TEXT_DIM).grow(1.0)),
+        )
+        .child(label(names, SIZE_SMALL, TEXT_SUB))
+        .child(label("这些章节在手环上登记着、但包内容读不出来。重新同步一次这一章即可恢复。", SIZE_SMALL, TEXT_DIM))
 }
 
 /// 连接状态与主操作。
@@ -251,5 +285,31 @@ mod tests {
         let texts = tree.texts();
         assert!(texts.iter().any(|text| *text == "等应用回应（第 3/12 次）"), "{texts:?}");
         assert!(!texts.iter().any(|text| text.contains("正在等待应用回应")), "半句话已收短：{texts:?}");
+    }
+}
+
+/// 注册表里读不出来的条目**必须说出来**（`scan` 现在只读，不剔除它们）。
+#[cfg(test)]
+mod broken_tests {
+    use super::*;
+    use crate::demo;
+
+    #[test]
+    fn broken_entries_are_surfaced_and_silent_when_none() {
+        let mut snapshot = demo();
+        assert!(snapshot.installed_broken.is_empty());
+        let clean = render(&snapshot);
+        assert!(
+            !clean.texts().iter().any(|text| text.contains("读不出来")),
+            "没有坏条目时不该出现任何相关文案：{:?}",
+            clean.texts()
+        );
+
+        snapshot.installed_broken = vec!["玲线2·初恋".to_string(), "结灯线3·相伴".to_string()];
+        let tree = render(&snapshot);
+        let texts = tree.texts();
+        assert!(texts.iter().any(|text| text.contains("2 条登记读不出来")), "{texts:?}");
+        assert!(texts.iter().any(|text| text.contains("玲线2·初恋、结灯线3·相伴")), "要逐条点名：{texts:?}");
+        assert!(texts.iter().any(|text| text.contains("重新同步一次这一章")), "要给「怎么办」：{texts:?}");
     }
 }

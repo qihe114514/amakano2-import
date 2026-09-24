@@ -4,6 +4,7 @@
 //! 页面逻辑也就能脱离宿主和业务状态单独测试。
 
 use std::sync::Arc;
+use super::errors::ErrorView;
 
 use serde_json::Value;
 
@@ -106,6 +107,73 @@ impl Page {
     /// 点击导航项时派发的动作 id。
     pub fn action(self) -> String {
         format!("{NAV_PREFIX}{}", self.wire())
+    }
+}
+
+/// 连接走到了哪一步。
+///
+/// 为什么要把「一条状态行」拆成阶段：旧实现里 **`request_pack_list` 只在 `alive == false`
+/// 的分支里发**，而 `hello-ok` 一回来就把 `alive` 置真、顺手把探测循环终止掉 ——
+/// 于是「通道通了」被当成了「数据就绪了」，章节列表永远拿不到。
+/// 那是个**概念混淆**的 bug，不是某个判断写错；把它拆成显式阶段之后，
+/// 「已握手」和「已拿到章节列表」是两件事，代码里再也没法把它们混为一谈。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum SessionStage {
+    /// 还没点「连接设备」。
+    Idle,
+    /// 在宿主里找到了在线设备。
+    DeviceFound,
+    /// 回包通道注册成功（`register_interconnect_recv`）。
+    ChannelRegistered,
+    /// 手环应用回应过任何一条消息 —— 说明它在前台活着。
+    AppAlive,
+    /// 能力协商完成（收到 `hello-ok`）。
+    Handshaked,
+    /// **已安装章节列表已拿到** —— 这是独立的里程碑，不是「握手顺带」。
+    CatalogReady,
+    /// 正在传（或刚传完一段、断点还在）。
+    Transferring,
+}
+
+impl SessionStage {
+    pub const ALL: [SessionStage; 7] = [
+        SessionStage::Idle,
+        SessionStage::DeviceFound,
+        SessionStage::ChannelRegistered,
+        SessionStage::AppAlive,
+        SessionStage::Handshaked,
+        SessionStage::CatalogReady,
+        SessionStage::Transferring,
+    ];
+
+    /// 第几步（从 0 数）。界面上的分段条按它点亮。
+    pub fn index(self) -> usize {
+        SessionStage::ALL.iter().position(|stage| *stage == self).unwrap_or(0)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionStage::Idle => "未连接",
+            SessionStage::DeviceFound => "已找到设备",
+            SessionStage::ChannelRegistered => "回包通道已就绪",
+            SessionStage::AppAlive => "手环应用已响应",
+            SessionStage::Handshaked => "能力协商完成",
+            SessionStage::CatalogReady => "章节列表已同步",
+            SessionStage::Transferring => "章节同步中",
+        }
+    }
+
+    /// 这一阶段的一条短说明（「还没走到这一步」时显示，告诉用户卡在哪）。
+    pub fn pending_hint(self) -> &'static str {
+        match self {
+            SessionStage::Idle => "点上面的「连接设备」开始",
+            SessionStage::DeviceFound => "正在注册回包通道…",
+            SessionStage::ChannelRegistered => "正在等手环应用响应（没反应就在手表上打开《甜蜜女友2》）",
+            SessionStage::AppAlive => "正在协商版本与能力…",
+            SessionStage::Handshaked => "正在读取手环上已安装的章节…",
+            SessionStage::CatalogReady => "可以点某一章的「同步」了",
+            SessionStage::Transferring => "传输中，请把手环停在《甜蜜女友2》页面",
+        }
     }
 }
 
@@ -674,10 +742,19 @@ impl Limits {
 pub struct Snapshot {
     pub page: Page,
     pub version: String,
+    /// 连接走到了哪一步。概览页的分段进度条按它点亮。
+    pub stage: SessionStage,
+    /// 最近一次失败（码 + 细节原文）。`None` 表示当前没有失败要讲。
+    pub error: Option<ErrorView>,
     pub device: DeviceView,
     pub library: Vec<PackView>,
     pub library_error: String,
     pub installed: Vec<InstalledView>,
+    /// 手环注册表里有、但 `pack.txt` 读不出来的章节包名。
+    ///
+    /// **不许静默**：「手环上真没装这一章」和「注册表里那条读不出来」是两件事，
+    /// 后者要么重传、要么清理注册表，用户得看得见才能决定。
+    pub installed_broken: Vec<String>,
     pub transfer: Option<TransferView>,
     pub resume: Option<ResumeView>,
     pub cache_bytes: usize,
@@ -756,6 +833,9 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            stage: SessionStage::Idle,
+            error: None,
+            installed_broken: Vec::new(),
             page: Page::Overview,
             version: String::new(),
             device: DeviceView::default(),

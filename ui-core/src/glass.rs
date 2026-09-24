@@ -8,7 +8,8 @@
 //! 挂着只是让预览里的悬停好看一点，界面状态一律靠**换实色**表达。
 
 use super::node::{Node, Tag, badge, label};
-use super::snapshot::{Page, Snapshot, StatusKind};
+use super::errors::ErrorView;
+use super::snapshot::{Page, SessionStage, Snapshot, StatusKind};
 use super::theme::*;
 
 /// 加透明度：只在 `#RRGGBB` 上用（`rgba(...)` 字符串会失效，别混用）。
@@ -776,5 +777,125 @@ mod tests {
         let main = title("甜蜜女友2");
         assert_eq!(main.get("fg"), Some(TEXT_MAIN), "主标题用主文色");
         assert_eq!(main.get("size"), Some("18"));
+    }
+}
+
+/// 连接进度：一条分段条 + 当前阶段的说明。
+///
+/// 把它做成**显式阶段**而不是一句状态行，是因为旧实现把「通道通了」当成「数据就绪了」
+/// —— `request_pack_list` 只挂在「还没活」那条分支上，`hello-ok` 一到就再也发不出去，
+/// 章节列表永远拿不到。拆成阶段之后，「已握手」和「已拿到章节列表」再也没法混为一谈。
+pub fn session_steps(stage: SessionStage) -> Node {
+    let total = SessionStage::ALL.len() as u32;
+    let done = stage.index() as u32 + 1;
+
+    let mut row = Node::new(Tag::Div).full().row().gap(4).align("center");
+    for step in 0..total {
+        let reached = step < done;
+        row = row.child(
+            Node::new(Tag::Div)
+                .h(4)
+                .grow(1.0)
+                .shrink(1.0)
+                .radius(2)
+                .bg(if reached { ACCENT } else { TRACK }),
+        );
+    }
+
+    let line = Node::new(Tag::Div)
+        .full()
+        .row()
+        .align("center")
+        .gap(GAP_XS)
+        .child(label(format!("{done}/{total}"), SIZE_SMALL, TEXT_DIM).shrink(0.0))
+        .child(label(stage.label(), SIZE_SMALL, TEXT_MAIN).weight(600).shrink(0.0));
+
+    Node::new(Tag::Div)
+        .full()
+        .column()
+        .gap(GAP_XS)
+        .child(row)
+        .child(line)
+        .child(label(stage.pending_hint(), SIZE_SMALL, TEXT_SUB))
+}
+
+/// 失败卡片：码的标题 + 细节原文 + 「怎么办」。
+///
+/// **细节原文原样显示**（手环回什么就写什么）：这一层存在的意义就是让
+/// 「超时」和「空间不足」在界面上长得不一样，顺手把对端那句话吞掉就白做了。
+pub fn error_card(error: &ErrorView) -> Node {
+    let mut card = Node::new(Tag::Div)
+        .full()
+        .column()
+        .gap(GAP_XS)
+        .pad(GAP)
+        .radius(CARD_RADIUS)
+        .bg(SURFACE)
+        .border(1, &alpha(BUTTON_DANGER, "66"))
+        .child(
+            Node::new(Tag::Div)
+                .full()
+                .row()
+                .align("center")
+                .gap(GAP_XS)
+                .child(state_badge(error.code.label(), StatusKind::Bad))
+                .child(Node::new(Tag::Div).grow(1.0)),
+        );
+    if !error.detail.trim().is_empty() {
+        card = card.child(label(error.detail.trim(), SIZE_SMALL, TEXT_SUB));
+    }
+    card.child(label(error.code.advice(), SIZE_SMALL, TEXT_DIM))
+}
+
+/// 连接进度条与失败卡片。
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use crate::ErrorCode;
+
+    /// 分段条的点亮段数 = 当前阶段的下标 + 1；当前阶段名与「下一步提示」都要写出来。
+    #[test]
+    fn session_steps_light_up_the_current_stage() {
+        for stage in SessionStage::ALL {
+            let node = session_steps(stage);
+            let filled = node
+                .find(|item| item.get("bg") == Some(ACCENT))
+                .len();
+            assert_eq!(
+                filled,
+                stage.index() + 1,
+                "{stage:?} 应该点亮 {} 段（走到哪一步就是几步）",
+                stage.index() + 1
+            );
+            let texts = node.texts();
+            assert!(texts.contains(&stage.label()), "{stage:?} 要写出阶段名：{texts:?}");
+            assert!(
+                texts.contains(&stage.pending_hint()),
+                "{stage:?} 要写出下一步提示：{texts:?}"
+            );
+        }
+        // 分段总数固定 = 阶段总数：少一段就说明有阶段永远点不亮。
+        let total = SessionStage::ALL.len();
+        let all_segments = session_steps(SessionStage::Idle).find(|item| item.has("bg")).len();
+        assert_eq!(all_segments, total);
+    }
+
+    /// 失败卡片：码的标题 + 细节原文 + 「怎么办」，三样都要出现，而且**原文原样带出来**。
+    #[test]
+    fn error_card_shows_code_detail_and_advice() {
+        let code = ErrorCode::Space;
+        let card = error_card(&ErrorView::new(code, "write-空间不足"));
+        let texts = card.texts();
+        assert!(texts.contains(&code.label()), "{texts:?}");
+        assert!(texts.contains(&code.advice()), "「怎么办」不能省：{texts:?}");
+        assert!(texts.contains(&"write-空间不足"), "对端的原文要原样显示：{texts:?}");
+    }
+
+    /// 细节为空时不留一行空白。
+    #[test]
+    fn error_card_without_detail_has_no_blank_line() {
+        let card = error_card(&ErrorView::new(ErrorCode::Timeout, ""));
+        let texts = card.texts();
+        assert_eq!(texts.len(), 2, "只该有标题和「怎么办」：{texts:?}");
     }
 }

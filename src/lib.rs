@@ -29,6 +29,31 @@ const MAX_SAVE_SLOTS: usize = 20;
 /// **缺席就等于「手环端应用太旧」**，界面上要给人话而不是超时。
 const SAVE_PROTOCOL: u32 = 1;
 
+/// 把「已写完的字节数」换算成**当前分片布局下**的分片下标。
+///
+/// `layout` 是每个分片的 `(字节数, 是不是某个文件的第一片)`。
+///
+/// 断点续传永远落在某个文件的**第一片**上（手环按文件边界记断点），所以这里找的是
+/// 「累计字节数已经够了、并且正好是某个文件开头」的那一片。
+///
+/// **为什么必须按字节算**：手环回的 `resumeFrom` 是**上一次那套分片布局**里的下标，
+/// 换过分片档位之后两套下标毫无对应关系。按字节游标算，换档最多重传一个文件；
+/// 按下标续，换档就是整章重来（真机就是这么把「刷新后必须从头传」做出来的）。
+fn resume_index_for_bytes(layout: &[(usize, bool)], done_bytes: usize) -> usize {
+    if done_bytes == 0 {
+        return 0;
+    }
+    let mut seen = 0usize;
+    for (index, (bytes, is_file_start)) in layout.iter().enumerate() {
+        if *is_file_start && seen >= done_bytes {
+            return index;
+        }
+        seen = seen.saturating_add(*bytes);
+    }
+    // 游标落在最后一片之后（手环保证 done_bytes < 总字节数，理论上到不了这里）。
+    layout.len()
+}
+
 // ------------------------------------------------------------------ 宿主侧实现
 
 #[cfg(target_arch = "wasm32")]
@@ -40,10 +65,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use amakano2_ui::{
-    Action, CHUNK_OPTIONS, DeviceView, InstalledView, Limits, LogFilter, PackView, Page,
-    PRESS_TIMEOUT_MS, ReadingStatsView, RefreshPlan, RefreshStep, ResumeView, SaveExportView,
-    SaveImportView, Snapshot, StatusKind, TransferView, band_envelope, chunk_label, human_bytes,
-    parse_action, refresh_steps,
+    Action, CHUNK_OPTIONS, DeviceView, ErrorCode, ErrorView, InstalledView, Limits, LogFilter,
+    PackView, Page, PRESS_TIMEOUT_MS, ReadingStatsView, RefreshPlan, RefreshStep, ResumeView,
+    SaveExportView, SaveImportView, SessionStage, Snapshot, StatusKind, TransferView, band_envelope,
+    chunk_label, human_bytes, parse_action, refresh_steps,
 };
 use astrobox_ng_wit::FutureReader;
 use astrobox_ng_wit::astrobox::psys_host;
@@ -58,7 +83,7 @@ use zip::ZipArchive;
 use crate::request::{FOLLOWUP_DELAY_MS, PendingRequest, RequestKind, Slot, TimeoutAction};
 use crate::saves;
 use crate::saves::now_ms;
-use crate::{MAX_SAVE_SLOTS, SAVE_PROTOCOL};
+use crate::{MAX_SAVE_SLOTS, SAVE_PROTOCOL, resume_index_for_bytes};
 
 // 宿主专属的两个模块：界面转换与剪贴板（都碰 `astrobox_ng_wit`）。
 //
@@ -79,6 +104,8 @@ const MAX_PACK_BYTES: usize = 20_000_000;
 const RETRY_DELAY_MS: u64 = 1500;
 const MAX_RETRIES: u8 = 4;
 const INITIAL_WINDOW: usize = 3;
+/// 窗口加法增长前要攒够多少个「顺利确认」。见 `retry_packet` 里那句减半。
+const WINDOW_GROWTH_ACKS: usize = 8;
 const MIN_TIMEOUT_MS: u64 = 800;
 const MAX_TIMEOUT_MS: u64 = 4000;
 const APP_START_DELAY_MS: u64 = 2000;
@@ -87,6 +114,15 @@ const MAX_READY_ATTEMPTS: u8 = 2;
 /// 连接后轮询手环应用：每 2.5 秒试一次，最多 12 次（30 秒内手动打开也能接上）。
 const PROBE_INTERVAL_MS: u64 = 2500;
 const MAX_PROBE_ATTEMPTS: u32 = 12;
+/// 稳态心跳间隔。连接期用 2.5 秒的密集探测（要尽快接上），接上之后没必要这么频繁 ——
+/// 手环上多打一次往返就多一次把系统堆搅动的机会（见 `transferGate` 那段真机记录）。
+const HEARTBEAT_INTERVAL_MS: u64 = 10_000;
+/// 心跳判定「静默」的阈值：超过这个时间没收到手环任何消息就算漏了一拍。
+const HEARTBEAT_SILENT_MS: u128 = 15_000;
+/// 连续漏几拍判定掉线。3 拍 ≈ 30 秒，用户能感觉到「连不上了」，又不会误判一次卡顿。
+const HEARTBEAT_MAX_MISSES: u32 = 3;
+/// 一次会话里同一章最多自动重试几次（断线自动恢复的防死循环闸门）。
+const MAX_AUTO_RESUME: u8 = 3;
 /// 一次存档回包最多允许多少片（手环侧是 9000 字节/片，这个上限远大于真实需要，
 /// 只是为了防止一个乱报 `seq` 的回包把内存吃掉）。
 const MAX_SAVE_SHARDS: u64 = 64;
@@ -127,6 +163,9 @@ struct Transfer {
     speed_window_bytes: usize,
     rtt_ms: u64,
     retry_count: u8,
+    /// 自上一次重传以来连续顺利确认的分片数。用来做窗口的**加法增长**：
+    /// 没有它的话，一次超时之后窗口就再也涨不回来（旧实现是直接永久设成 1）。
+    stable_acks: usize,
     ready: bool,
     started: bool,
     waiting_ready: bool,
@@ -176,6 +215,27 @@ struct State {
     /// 手环应用已经回应过消息（说明《甜蜜女友2》正在前台运行）。
     alive: bool,
     probe_attempt: u32,
+    /// 连接会话号。每次「连接设备」+1，探测/心跳定时器的载荷里带着它 ——
+    /// 重连之后上一轮残留的定时器回来时会因为对不上号而被丢掉，
+    /// 否则会有两条心跳链并行、每轮翻一倍。
+    session: u64,
+    /// 稳态心跳连续几次没被回应。到上限就判定掉线并自动重连。
+    heartbeat_misses: u32,
+    /// 最近一次收到手环任何消息的时刻（`mark_alive()` 刷新）。心跳据此判断「静默了多久」。
+    last_alive_ms: u128,
+    /// 连接走到了哪一步（概览页的分段进度条）。只前进不后退，重连时重置。
+    stage: SessionStage,
+    /// 最近一次失败（码 + 细节原文）。成功路径/重新开始时会清掉。
+    error: Option<ErrorView>,
+    /// 手环注册表里有、但 `pack.txt` 读不出来的章节包名（`scan` 现在只读，
+    /// 不剔除它们，所以要在这里说出来）。
+    installed_broken: Vec<String>,
+    /// 需要在 `on_event` 的 block_on **之外**执行一次自动重连。
+    /// （`connect_device()` 自己会 `block_on`，在 block_on 里再调它等于嵌套，会死锁。）
+    reconnect_pending: bool,
+    /// 断线前正在传的那一章 —— 重连并拿到手环断点后自动接着传。
+    /// `(章节号, 包名, 已经自动重试过几次)`。次数是防死循环的闸门。
+    auto_resume: Option<(usize, String, u8)>,
     library: Vec<LibraryPack>,
     library_error: String,
     sync_queue: Vec<usize>,
@@ -273,6 +333,14 @@ fn state() -> &'static Mutex<State> {
             connected: false,
             alive: false,
             probe_attempt: 0,
+            session: 0,
+            stage: SessionStage::Idle,
+            error: None,
+            installed_broken: Vec::new(),
+            heartbeat_misses: 0,
+            last_alive_ms: 0,
+            reconnect_pending: false,
+            auto_resume: None,
             library: Vec::new(),
             library_error: String::new(),
             sync_queue: Vec::new(),
@@ -321,6 +389,26 @@ fn update<T>(action: impl FnOnce(&mut State) -> T) -> T {
     action(&mut state().lock().unwrap_or_else(|error| error.into_inner()))
 }
 
+/// 推进连接阶段。**只前进不后退**：分段条是「走到哪了」，倒退会闪。
+/// 重新连接时在 `connect_device` 里显式重置。
+fn set_stage(stage: SessionStage) {
+    update(|state| {
+        if stage > state.stage {
+            state.stage = stage;
+        }
+    });
+}
+
+/// 记一条失败。文案不在这里生成 —— 插件只产出「码 + 细节原文」，
+/// 结论与「怎么办」统一由 ui-core 的 `ErrorCode` 给（派生结果只允许一处实现）。
+fn set_error(code: ErrorCode, detail: impl Into<String>) {
+    update(|state| state.error = Some(ErrorView::new(code, detail)));
+}
+
+fn clear_error() {
+    update(|state| state.error = None);
+}
+
 fn set_status(kind: StatusKind, text: impl Into<String>) {
     update(|state| {
         state.status_kind = kind;
@@ -365,6 +453,7 @@ fn transfer_with_chunks(chunk_bytes: usize, chunks: Vec<TransferChunk>) -> Trans
         speed_window_bytes: 0,
         rtt_ms: 0,
         retry_count: 0,
+        stable_acks: 0,
         ready: false,
         started: false,
         waiting_ready: false,
@@ -388,6 +477,9 @@ fn begin_packet(meta: &PackMeta, transfer: &Transfer) -> String {
         "files": meta.file_count,
         "bytes": meta.total_bytes,
         "chunks": transfer.chunks.len(),
+        // 声明要批量确认。手环没这个字段就按逐片确认走（旧版手环照旧能用），
+        // 协议升级靠**能力协商**，不靠版本号猜。
+        "ack": "batch",
     })
     .to_string()
 }
@@ -493,6 +585,7 @@ fn start_embedded_transfer(number: usize) {
         }
     };
     if data.len() > MAX_PACK_BYTES {
+        set_error(ErrorCode::BadPack, format!("{} 体积异常（{}）", pack.title, human_bytes(data.len())));
         set_status(StatusKind::Bad, format!("{} 体积异常（{}），请重新安装插件", pack.title, human_bytes(data.len())));
         render();
         return;
@@ -500,6 +593,7 @@ fn start_embedded_transfer(number: usize) {
     let (mut meta, files) = match parse_pack(&data) {
         Ok(value) => value,
         Err(message) => {
+            set_error(ErrorCode::BadPack, format!("{}：{message}", pack.title));
             set_status(StatusKind::Bad, format!("{}：{message}", pack.title));
             render();
             return;
@@ -514,7 +608,9 @@ fn start_embedded_transfer(number: usize) {
         let matches_resume = state
             .resume
             .as_ref()
-            .map(|pending| pending.pack_id == meta.pack_id && pending.bytes == meta.total_bytes && pending.chunks == count)
+            // **判据里不该有分片数**：换过档位之后 `pending.chunks` 与当前布局必然不同，
+            // 把它算进来会让「与未完成传输匹配」永远为假，界面就会说「正在从头同步」。
+            .map(|pending| pending.pack_id == meta.pack_id && pending.bytes == meta.total_bytes)
             .unwrap_or(false);
         state.transfer = Some(transfer_with_chunks(state.chunk_bytes, chunks));
         state.pack_files = files;
@@ -539,12 +635,15 @@ fn queue_sync(numbers: Vec<usize>) {
     let first = {
         let mut current = state().lock().unwrap_or_else(|error| error.into_inner());
         current.sync_queue = numbers;
+        // 「同步全部未安装」的队列要能扛住插件刷新：落盘一份，`on_load` 再读回来。
+        // 真正的进度仍然只认手环的断点，这里只是「用户想传哪些章」的意图。
         if current.sync_queue.is_empty() {
             None
         } else {
             Some(current.sync_queue.remove(0))
         }
     };
+    save_persisted();
     match first {
         Some(number) => start_embedded_transfer(number),
         None => {
@@ -556,12 +655,19 @@ fn queue_sync(numbers: Vec<usize>) {
 
 /// 传输完成后取出下一章；返回 None 表示队列已空。
 fn pop_sync_queue() -> Option<(usize, usize)> {
-    let mut current = state().lock().unwrap_or_else(|error| error.into_inner());
-    if current.sync_queue.is_empty() {
-        return None;
+    let result = {
+        let mut current = state().lock().unwrap_or_else(|error| error.into_inner());
+        if current.sync_queue.is_empty() {
+            None
+        } else {
+            let number = current.sync_queue.remove(0);
+            Some((number, current.sync_queue.len()))
+        }
+    };
+    if result.is_some() {
+        save_persisted();
     }
-    let number = current.sync_queue.remove(0);
-    Some((number, current.sync_queue.len()))
+    result
 }
 
 fn parse_pack(data: &[u8]) -> Result<(PackMeta, Vec<PackFile>), String> {
@@ -688,6 +794,9 @@ fn snapshot() -> Snapshot {
     Snapshot {
         page: current.page,
         version: current.version.clone(),
+        stage: current.stage,
+        error: current.error.clone(),
+        installed_broken: current.installed_broken.clone(),
         device: DeviceView {
             name: current.device_name.clone(),
             addr: current.device_addr.clone(),
@@ -848,9 +957,21 @@ fn plugin_version() -> String {
         .unwrap_or_default()
 }
 
+/// 一个分片的超时窗口。
+///
+/// **还没有 RTT 样本时给最宽的一档，不给 `RETRY_DELAY_MS`。** 真机实测首包 RTT 是
+/// 1032 ms，而 1500 ms 的默认值只留了 45% 余量 —— 结果第 2 片在 1500 ms 到点被误判
+/// 超时（`retry=true`），既白费一个往返，又当场把窗口砍掉。丢第一片的代价只是多等
+/// 几秒，误判的代价是整章提速失败，两者不对称。
+///
+/// 有样本之后按 `rtt × (窗口 + 1)` 估：在途窗口里排在前面的分片本来就要等，
+/// 只看 `rtt` 会把「排队」误判成「丢了」。
 fn timeout_ms(transfer: &Transfer) -> u64 {
-    let estimate = if transfer.rtt_ms == 0 { RETRY_DELAY_MS } else { transfer.rtt_ms.saturating_mul(4) };
-    estimate.clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
+    if transfer.rtt_ms == 0 {
+        return MAX_TIMEOUT_MS;
+    }
+    let depth = (transfer.window_size as u64).saturating_add(1);
+    transfer.rtt_ms.saturating_mul(depth).clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
 }
 
 fn chunk_payload(transfer: &Transfer, index: usize) -> String {
@@ -1001,6 +1122,21 @@ fn fail_request(kind: RequestKind) {
             }
         }
     };
+    // **码是给机器看的**：界面靠它区分「等一等就好」和「得去腾空间 / 换档位 / 更新版本」。
+    // 判定顺序和上面那句人话完全一致，别让两者漂开。
+    let code = match kind {
+        RequestKind::StatsList if stats_blocked => ErrorCode::Protocol,
+        RequestKind::StatsList => ErrorCode::Timeout,
+        RequestKind::Hello | RequestKind::SaveList | RequestKind::SavePut | RequestKind::SaveDelete | RequestKind::SaveActivate => {
+            if saves_blocked {
+                ErrorCode::Protocol
+            } else {
+                ErrorCode::Timeout
+            }
+        }
+        _ => ErrorCode::Timeout,
+    };
+    set_error(code, message);
     set_status(StatusKind::Bad, message);
     // 存档相关的超时同时落到存档页的状态上：用户可能正停在那一页。
     if kind.is_saves() {
@@ -1059,7 +1195,7 @@ async fn send_packet(addr: String, payload: String, index: usize, retry: bool) {
         tracing::info!(index, bytes = payload.len(), retry, "sending pack chunk");
     }
     if psys_host::interconnect::send_qaic_message(&addr, PACKAGE_NAME, &payload).await.is_err() {
-        fail_transfer("发送被链路拒绝");
+        fail_transfer(ErrorCode::Link, "发送被链路拒绝");
         return;
     }
     let retry_payload = {
@@ -1090,7 +1226,17 @@ async fn send_next_packet() {
 }
 
 /// 传输中断：不改分片档位，保留断点，提示用户重连后继续。
-fn fail_transfer(reason: &str) {
+///
+/// **必须把 `pack_meta` / `transfer` 一起清掉。** 界面上的 `PackView::active` 判的是
+/// 「`pack_meta.chapter_number` 等于这一章的号」，而章节行在 `active` 时渲染的是
+/// `state_badge("传输中")` —— **一个徽章，不是按钮**（`ui-core/src/pages/library.rs:154`）。
+/// 只清 `started` 不清 `pack_meta` 的话，失败的那一章会永久显示「传输中」且点不动，
+/// 只能靠「同步任意其它章」或重载插件脱困。
+/// 真机复现：2026-09-24 18:02 第 2 章传输失败后，那一章的按钮再也点不动。
+///
+/// 断点本身不会因此丢：权威进度在手环的 `pending-install` 里，这里放开的只是
+/// 「当前这一章正在传」这个**会话内**状态，让按钮重新可点。
+fn fail_transfer(code: ErrorCode, reason: &str) {
     update(|state| {
         if let Some(transfer) = state.transfer.as_mut() {
             transfer.started = false;
@@ -1099,11 +1245,41 @@ fn fail_transfer(reason: &str) {
             transfer.in_flight.clear();
             transfer.window_size = INITIAL_WINDOW;
         }
-        state.status = format!("连接已断开（{reason}）。请在 AstroBox 里重新连接设备，再点「继续同步」接着传");
+        // 记下「刚才在传哪一章」—— 重连并拿到手环断点后自动接着传。
+        // **必须在清 `pack_meta` 之前取**。次数是防死循环的闸门：同一章最多自动重试
+        // `MAX_AUTO_RESUME` 次，超了就留给用户决定。
+        if let Some(meta) = state.pack_meta.as_ref() {
+            let attempts = state
+                .auto_resume
+                .as_ref()
+                .filter(|(_, id, _)| *id == meta.pack_id)
+                .map(|(_, _, attempts)| *attempts)
+                .unwrap_or(0);
+            if attempts < MAX_AUTO_RESUME {
+                state.auto_resume = Some((meta.chapter_number, meta.pack_id.clone(), attempts + 1));
+            } else {
+                tracing::warn!(attempts, pack = %meta.pack_id, "auto-resume budget exhausted");
+                state.auto_resume = None;
+            }
+        }
+        state.transfer = None;
+        state.pack_meta = None;
+        state.pack_files = Vec::new();
+        // 阶段退回到「应用活着」：链路断了，后面的章节列表/传输都还不成立。
+        state.stage = state.stage.min(SessionStage::AppAlive);
+        state.error = Some(ErrorView::new(code, reason));
+        state.status = format!("连接已断开（{reason}）。正在自动重连并接着传（也可以在 AstroBox 里手动重连）");
         state.status_kind = StatusKind::Bad;
+        // 断线恢复不该等用户点：直接排队一次自动重连（由 `on_event` 在 block_on 之外执行）。
+        state.reconnect_pending = true;
+        state.alive = false;
     });
+    // 「刚才在传哪一章」也要落盘：插件被重启/刷新后 `on_load` 读回它，
+    // 配合手环的断点就能接着传，而不是等用户重新点一遍。
+    save_persisted();
     render();
 }
+
 
 enum RetryAction {
     Resend(String, String, usize),
@@ -1126,11 +1302,15 @@ fn retry_packet(payload: &str) -> Option<RetryAction> {
     }
     if transfer.retry_count >= MAX_RETRIES {
         drop(current);
-        fail_transfer("连续超时");
+        fail_transfer(ErrorCode::Timeout, "连续超时");
         return Some(RetryAction::Failed);
     }
     transfer.retry_count += 1;
-    transfer.window_size = 1;
+    // **窗口减半，不是永久设成 1。** 旧实现一句 `window_size = 1` 之后整章退化成停等
+    // （真机实测 872 ms/片、一整章要好几分钟），而且再没有任何路径把它涨回去。
+    // 这里按 AIMD 的乘法减小处理，后面在确认分支里做加法增长。
+    transfer.window_size = (transfer.window_size / 2).max(1);
+    transfer.stable_acks = 0;
     transfer.in_flight.retain(|(value, _)| *value == index);
     transfer.next_index = transfer.next_index.min(index + 1);
     let retry = transfer.retry_count;
@@ -1167,7 +1347,7 @@ fn handle_ready_timeout(request_id: &str) {
             });
             arm_timer(READY_TIMEOUT_MS, json!({ "type": "amakano.timer", "kind": "ready", "requestId": request_id }).to_string());
         }
-        None => fail_transfer("手表未响应导入请求"),
+        None => fail_transfer(ErrorCode::Timeout, "手表未响应导入请求"),
     }
 }
 
@@ -1188,8 +1368,27 @@ async fn handle_timer(payload: &str) {
             }
         }
         Some("pending") => request_pending().await,
-        Some("probe") => probe_tick().await,
-        Some("list") => request_pack_list(false).await,
+        // 探测/心跳：载荷里带会话号，**上一轮连接残留的定时器一律丢掉** ——
+        // 否则重连之后会有两条心跳链并行，而且每轮翻一倍。
+        Some("probe") => {
+            let session = value.get("session").and_then(Value::as_u64).unwrap_or(0);
+            if update(|state| state.session == session) {
+                probe_tick(session).await;
+            } else {
+                tracing::debug!(session, "stale probe/heartbeat timer ignored");
+            }
+        }
+        // 补拉章节列表。坑位被占就**隔一拍重试**，**绝不静默丢弃** ——
+        // 「静默丢弃」正是「连接后半天读不到已安装章节」那条真机故障的形态
+        // （2026-09-24 20:10：用户卡在「正在读取手环上已安装的章节…」）。
+        // 坑位最终一定会空出来（请求有 1–2 秒超时兜底），所以这个重试会收敛。
+        Some("list") => {
+            if update(|state| state.request.busy()) {
+                arm_timer(FOLLOWUP_DELAY_MS, json!({ "type": "amakano.timer", "kind": "list" }).to_string());
+            } else {
+                request_pack_list(false).await;
+            }
+        }
         // 「刷新」的下一个往返（前一个已经 settle，见 `settle_refresh_step`）。
         Some("refresh-next") => {
             let next = update(|state| {
@@ -1232,6 +1431,16 @@ fn connect_device() {
             state.device_name = name;
             state.alive = false;
             state.probe_attempt = 0;
+            // 新会话：上一轮残留的探测/心跳定时器就此作废（见 `session` 字段的说明）。
+            state.session = state.session.wrapping_add(1);
+            // 重新连接就把进度条**重置**：分段条说的是「这一次走到哪了」，
+            // 上一轮的「章节列表已同步」不成立（列表还得重新拉）。
+            state.stage = SessionStage::DeviceFound;
+            state.error = None;
+            state.installed_broken.clear();
+            state.heartbeat_misses = 0;
+            state.last_alive_ms = now_ms();
+            state.reconnect_pending = false;
             state.pending_checked = false;
             state.sync_queue.clear();
             state.status = "正在连接手环…".into();
@@ -1247,6 +1456,7 @@ fn connect_device() {
         }
         // 注册成功即视为「通道已建立」；应用是否在前台由探测循环判断。
         update(|state| state.connected = true);
+        set_stage(SessionStage::ChannelRegistered);
         let auto_launch = {
             let current = state().lock().unwrap_or_else(|error| error.into_inner());
             current.auto_launch
@@ -1264,7 +1474,7 @@ fn connect_device() {
         render();
         tracing::info!(?hint, "connect finished");
         // 先给应用 2 秒启动时间，然后按固定间隔轮询；手动打开也能接上。
-        arm_timer(APP_START_DELAY_MS, json!({ "type": "amakano.timer", "kind": "probe" }).to_string());
+        arm_probe(APP_START_DELAY_MS, update(|state| state.session));
         // 通道建立后顺手问一次存档能力：`hello-ok` 缺席就等于「手环端应用太旧」。
         // 探测循环随后仍会照旧发 pack.list（那是既有链路，不动它）。
         request_hello().await;
@@ -1422,30 +1632,55 @@ async fn request_save_activate(slot: usize) {
 }
 
 /// 连接后轮询：手动打开手环应用也能自动接上，回应一次就进入「已连接」。
-async fn probe_tick() {
-    let (addr, alive, attempt, busy) = {
+/// 连接期探测 + 稳态心跳，一条链走完。
+///
+/// 旧实现里 `alive` 分支处理完存档能力就 `return` 且**不重新挂定时器** —— 探测循环
+/// 就此终止，之后掉线、手环应用被杀都发现不了，要等用户下一次操作才暴露。
+/// 现在这个分支改成挂**较长的**心跳间隔，并由心跳判定掉线。
+async fn probe_tick(session: u64) {
+    let (addr, alive, attempt, busy, last_alive) = {
         let current = state().lock().unwrap_or_else(|error| error.into_inner());
-        (current.device_addr.clone(), current.alive, current.probe_attempt, current.request.busy())
+        (current.device_addr.clone(), current.alive, current.probe_attempt, current.request.busy(), current.last_alive_ms)
     };
     if addr.is_empty() {
         return;
     }
     if alive {
-        // 应用已经被证明是活的：若还没协商到存档协议，就**再问一次**。
-        // 不能只在「连接设备」里问一次 —— 那一下手环可能还没醒（或还没装新版 RPK），
-        // 握手就永远没人应答，界面会一直说「手环端应用过旧」，除非用户手动重连。
-        let need_hello = {
-            let current = state().lock().unwrap_or_else(|error| error.into_inner());
-            current.save_protocol.is_none()
-        };
-        if need_hello && !busy && attempt < MAX_PROBE_ATTEMPTS {
-            update(|state| state.probe_attempt = attempt + 1);
-            tracing::info!(attempt = attempt + 1, "app is alive: asking save capability");
-            request_hello().await;
-            arm_timer(PROBE_INTERVAL_MS, json!({ "type": "amakano.timer", "kind": "probe" }).to_string());
+        // ── 稳态：心跳 ──
+        let silent = now_ms().saturating_sub(last_alive);
+        if silent > HEARTBEAT_SILENT_MS {
+            let misses = update(|state| {
+                state.heartbeat_misses += 1;
+                state.heartbeat_misses
+            });
+            if misses >= HEARTBEAT_MAX_MISSES {
+                // 判定掉线 → 自动重连。
+                // **不在这里直接调 `connect_device()`**：这个函数是在 `block_on` 里被 await 的，
+                // 而 `connect_device()` 自己也会 block_on，嵌套会死锁。打标记，交给
+                // `on_event` 在 block_on 之外执行。
+                tracing::warn!(misses, silent, "heartbeat lost: scheduling reconnect");
+                set_status(StatusKind::Warn, "手环应用失去响应，正在自动重连…");
+                update(|state| {
+                    state.alive = false;
+                    state.reconnect_pending = true;
+                });
+                render();
+                return;
+            }
+            tracing::warn!(misses, silent, "heartbeat missed");
+            set_status(StatusKind::Warn, format!("手环应用没有响应（{misses}/{HEARTBEAT_MAX_MISSES}）…"));
+            render();
         }
+        // 心跳用 `amakano.app.hello`：手环只回一份能力表，不读 storage，是最便宜的一次往返。
+        // `probe = true` 让超时**静默让位**（不重发、不报错），判定完全交给上面的漏拍计数 ——
+        // 心跳漏一拍不该弹「手环端应用版本过旧」。
+        if !busy {
+            request_heartbeat().await;
+        }
+        arm_probe(HEARTBEAT_INTERVAL_MS, session);
         return;
     }
+    // ── 连接期：密集探测（要尽快接上，所以间隔短） ──
     if !busy {
         if attempt >= MAX_PROBE_ATTEMPTS {
             set_status(
@@ -1463,16 +1698,119 @@ async fn probe_tick() {
         render();
         request_pack_list(true).await;
     }
-    arm_timer(PROBE_INTERVAL_MS, json!({ "type": "amakano.timer", "kind": "probe" }).to_string());
+    arm_probe(PROBE_INTERVAL_MS, session);
+}
+
+/// 心跳：用 `amakano.app.hello` 探活（`probe = true`，超时静默）。
+async fn request_heartbeat() {
+    let id = format!("hb-{}", now_ms());
+    let payload = json!({ "type": "amakano.app.hello", "requestId": id, "protocol": SAVE_PROTOCOL }).to_string();
+    dispatch_request(RequestKind::Hello, payload, id, true).await;
 }
 
 fn mark_alive() {
+    let now = now_ms();
     update(|state| {
         if !state.alive {
             state.alive = true;
             state.probe_attempt = 0;
         }
+        // 心跳靠这个时间戳判断「静默了多久」：手环回任何一条消息都算活着。
+        state.last_alive_ms = now;
+        state.heartbeat_misses = 0;
     });
+    // 「手环应用回应过任何一条消息」本身就是一级里程碑：它证明应用在前台活着。
+    set_stage(SessionStage::AppAlive);
+}
+
+/// 插件自己的持久化：**只放偏好与「上次在传哪一章」这类线索，绝不放进度权威。**
+///
+/// 进度权威在手环的 `pending-install` 里 —— 宿主在**更新/重装插件时会把整个插件目录删掉**
+/// （宿主源码 `activate_staged_plugin` 就是 rename 到 backup 再 `remove_dir_all`，
+/// 项目文档也记着「安装失败会把已安装插件的目录删掉」）。所以这里的东西随时可能丢，
+/// 丢了只该影响「选项回默认值」，**绝不能让断点失效** —— 这也正是断点必须以手环的
+/// 字节游标为准的原因（见 `resume_index_for_bytes`）。
+const SETTINGS_FILE: &str = "state.json";
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Persisted {
+    #[serde(default, rename = "chunkBytes")]
+    chunk_bytes: usize,
+    #[serde(default, rename = "autoLaunch")]
+    auto_launch: Option<bool>,
+    #[serde(default, rename = "queue")]
+    queue: Vec<usize>,
+    #[serde(default, rename = "autoResumeChapter")]
+    auto_resume_chapter: Option<usize>,
+    #[serde(default, rename = "autoResumePack")]
+    auto_resume_pack: String,
+    #[serde(default, rename = "autoResumeAttempts")]
+    auto_resume_attempts: u8,
+}
+
+/// 落盘一次。失败只记日志、**绝不打断任何流程** —— 存不下偏好不该让同步失败。
+fn save_persisted() {
+    let data = {
+        let current = state().lock().unwrap_or_else(|error| error.into_inner());
+        Persisted {
+            chunk_bytes: current.chunk_bytes,
+            auto_launch: Some(current.auto_launch),
+            queue: current.sync_queue.clone(),
+            auto_resume_chapter: current.auto_resume.as_ref().map(|(number, _, _)| *number),
+            auto_resume_pack: current.auto_resume.as_ref().map(|(_, id, _)| id.clone()).unwrap_or_default(),
+            auto_resume_attempts: current.auto_resume.as_ref().map(|(_, _, attempts)| *attempts).unwrap_or(0),
+        }
+    };
+    match serde_json::to_string(&data) {
+        Ok(text) => {
+            if let Err(error) = fs::write(SETTINGS_FILE, text) {
+                tracing::warn!(%error, file = SETTINGS_FILE, "settings could not be saved");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "settings could not be serialized"),
+    }
+}
+
+/// `on_load` 时读回来。同样**只影响预设值**：读不到 / 读坏了都退回默认，不报错挡路。
+fn load_persisted() {
+    let text = match fs::read_to_string(SETTINGS_FILE) {
+        Ok(text) => text,
+        // 第一次运行、或者插件目录刚被重装清掉 —— 都是正常的，不是错误。
+        Err(_) => return,
+    };
+    let saved = match serde_json::from_str::<Persisted>(&text) {
+        Ok(saved) => saved,
+        Err(error) => {
+            // 读坏了**必须看得见**：静默退回默认会让「设置老是自己变回去」查不出来。
+            tracing::warn!(%error, file = SETTINGS_FILE, "saved settings unreadable; using defaults");
+            return;
+        }
+    };
+    update(|state| {
+        // 分片档位只在它是合法档位时才采用（旧版本可能存过已经删掉的档位）。
+        if CHUNK_OPTIONS.contains(&saved.chunk_bytes) {
+            state.chunk_bytes = saved.chunk_bytes;
+        }
+        if let Some(flag) = saved.auto_launch {
+            state.auto_launch = flag;
+        }
+        state.sync_queue = saved.queue.into_iter().filter(|number| *number >= 1).collect();
+        if let Some(number) = saved.auto_resume_chapter {
+            if !saved.auto_resume_pack.is_empty() {
+                state.auto_resume = Some((number, saved.auto_resume_pack, saved.auto_resume_attempts.min(MAX_AUTO_RESUME)));
+            }
+        }
+    });
+    let (chunk_bytes, queue, auto_resume) = {
+        let current = state().lock().unwrap_or_else(|error| error.into_inner());
+        (current.chunk_bytes, current.sync_queue.len(), current.auto_resume.is_some())
+    };
+    tracing::info!(chunk_bytes, queue, auto_resume, "restored saved settings");
+}
+
+/// 挂一个带会话号的探测/心跳定时器。
+fn arm_probe(delay_ms: u64, session: u64) {
+    arm_timer(delay_ms, json!({ "type": "amakano.timer", "kind": "probe", "session": session }).to_string());
 }
 
 fn set_chunk_size(size: usize) -> bool {
@@ -1512,6 +1850,7 @@ fn set_chunk_size(size: usize) -> bool {
     });
     set_status(kind, message);
     render();
+    save_persisted();
     true
 }
 
@@ -1566,6 +1905,8 @@ async fn start_transfer() {
         return;
     };
     if psys_host::interconnect::send_qaic_message(&addr, PACKAGE_NAME, &payload).await.is_ok() {
+        set_stage(SessionStage::Transferring);
+        clear_error();
         set_status(StatusKind::Info, "已发送导入请求，等待手表确认…");
         arm_timer(READY_TIMEOUT_MS, json!({ "type": "amakano.timer", "kind": "ready", "requestId": request_id }).to_string());
         tracing::info!(bytes = payload.len(), "sent pack begin request");
@@ -1581,12 +1922,22 @@ async fn start_transfer() {
     render();
 }
 
-fn apply_ready(transfer: &mut Transfer, resume_from: usize, resumed: bool) {
+fn apply_ready(transfer: &mut Transfer, reported_from: usize, resume_bytes: usize, resumed: bool) {
+    // **以字节游标为准。** 手环回的 `resumeFrom` 是上一次那套布局里的下标，换过分片档位
+    // 之后不能用；`resumeBytes`（已写完文件的字节数之和）跟分片怎么切无关，
+    // 按它在**当前**布局里重新定位，换档最多重传一个文件。
+    let resume_from = if resume_bytes > 0 {
+        let layout: Vec<(usize, bool)> = transfer.chunks.iter().map(|chunk| (chunk.bytes, !chunk.append)).collect();
+        resume_index_for_bytes(&layout, resume_bytes)
+    } else {
+        reported_from.min(transfer.chunks.len())
+    };
     let resume_from = resume_from.min(transfer.chunks.len());
     transfer.next_index = resume_from;
     transfer.in_flight.clear();
     transfer.window_size = INITIAL_WINDOW;
     transfer.retry_count = 0;
+    transfer.stable_acks = 0;
     transfer.rtt_ms = 0;
     transfer.speed_window_start = now_ms();
     transfer.speed_window_bytes = 0;
@@ -1611,6 +1962,8 @@ fn handle_interconnect(payload: &str) -> bool {
                     pack_id: value.get("packId").and_then(Value::as_str)?.to_string(),
                     chapter_name: value.get("chapterName").and_then(Value::as_str).unwrap_or("未命名章节包").to_string(),
                     bytes: value.get("bytes").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    // 手环报的分片数是**它那套布局**下的数量，只用来打诊断日志 ——
+                    // 它绝不能参与「能不能续传」的判定（换过档位就对不上了，见 `resume_index_for_bytes`）。
                     chunks: value.get("chunks").and_then(Value::as_u64).unwrap_or(0) as usize,
                     resume_from: value.get("resumeFrom").and_then(Value::as_u64).unwrap_or(0) as usize,
                     received_bytes: value.get("receivedBytes").and_then(Value::as_u64).unwrap_or(0) as usize,
@@ -1628,7 +1981,39 @@ fn handle_interconnect(payload: &str) -> bool {
                 };
                 state.status_kind = if state.resume.is_some() { StatusKind::Warn } else { StatusKind::Info };
             });
+            if let Some(item) = state().lock().unwrap_or_else(|error| error.into_inner()).resume.clone() {
+                tracing::info!(
+                    pack = %item.pack_id,
+                    bytes = item.bytes,
+                    chunks = item.chunks,
+                    resume_bytes = item.received_bytes,
+                    files_done = item.files_done,
+                    "band reported an unfinished transfer (cursor is authoritative, chunks is diagnostic only)"
+                );
+            }
             render();
+            // 自动恢复：断线/被重启前正在传的那一章，只要手环的断点还在，就接着传下去。
+            // 断点不在了（传完了、或被清缓存清掉）就把标记丢掉，别留着反复试。
+            let resume_now = update(|state| {
+                let pending_id = state.resume.as_ref().map(|item| item.pack_id.clone());
+                match (&state.auto_resume, pending_id) {
+                    (Some((number, id, _)), Some(pending)) if *id == pending => {
+                        let number = *number;
+                        state.auto_resume = None;
+                        Some(number)
+                    }
+                    _ => {
+                        state.auto_resume = None;
+                        None
+                    }
+                }
+            });
+            save_persisted();
+            if let Some(number) = resume_now {
+                tracing::info!(number, "auto-resuming the interrupted chapter");
+                start_embedded_transfer(number);
+                return false;
+            }
             arm_timer(300, json!({ "type": "amakano.timer", "kind": "list" }).to_string());
             return false;
         }
@@ -1658,11 +2043,25 @@ fn handle_interconnect(payload: &str) -> bool {
             installed.sort_by_key(|pack| pack.chapter_number);
             let cache_bytes = message.get("cacheBytes").and_then(Value::as_u64).unwrap_or(0) as usize;
             let cache_files = message.get("cacheFiles").and_then(Value::as_u64).unwrap_or(0) as usize;
+            // 注册表里有、但 `pack.txt` 读不出来的条目。手环侧 `scan` 现在只读、**不剔除**
+            // 它们（旧实现会剔，一次瞬时读失败就永久丢一章），所以必须在这里说出来。
+            let broken: Vec<String> = message
+                .get("broken")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            if !broken.is_empty() {
+                tracing::warn!(?broken, "band registry has unreadable entries");
+            }
             let ask_pending = {
                 let mut current = state().lock().unwrap_or_else(|error| error.into_inner());
                 let ask = !current.pending_checked;
                 current.pending_checked = true;
                 current.installed = installed;
+                current.installed_broken = broken;
+                // **这一行才是「章节列表拿到了」那个独立里程碑。**
+                // 旧实现把它当成「握手顺带的事」，于是握手一成功就再也没人去拉列表。
+                current.stage = current.stage.max(SessionStage::CatalogReady);
                 current.cache_bytes = cache_bytes;
                 current.cache_files = cache_files;
                 if current.resume.is_none() && cache_bytes == 0 {
@@ -1723,6 +2122,9 @@ fn handle_interconnect(payload: &str) -> bool {
             // 阅读统计是独立的一条能力：老版本手环只报 ['saves','packs']。
             let supports_stats = features.iter().any(|feature| feature == "stats");
             tracing::info!(protocol, version = %version, version_code, ?features, "band save capability reported");
+            set_stage(SessionStage::Handshaked);
+            // `None` = 这次是第一次协商出来（心跳会反复回 hello-ok，别每次都当首次）。
+            let was_negotiated = Some(state().lock().unwrap_or_else(|error| error.into_inner()).save_protocol.is_some());
             update(|state| {
                 state.band_version = version.clone();
                 state.save_protocol = (protocol >= SAVE_PROTOCOL && supports_saves).then_some(protocol);
@@ -1748,8 +2150,46 @@ fn handle_interconnect(payload: &str) -> bool {
                     state.status_kind = StatusKind::Warn;
                 }
             });
+            // 是不是**首次**协商：心跳也走同一条 `hello`，如果每次回包都补拉列表，
+            // 10 秒一次的探测就变成「10 秒一次 storage 读 + 10 秒一次注册表重写」，
+            // 白搅动手环的内存与闪存。
+            let first_negotiation = was_negotiated == Some(false);
             render();
-            if supports_saves && protocol >= SAVE_PROTOCOL {
+            // **握手成功 = 手环应用已经活过来了 → 必须补一次章节列表。**
+            //
+            // 这一条是「连接手环后拿不到已安装章节列表」的直接修复。旧实现里 `pack.list`
+            // 只在 `probe_tick` 的 `!alive` 分支里发（见 `probe_tick`），而 `hello-ok` 一到
+            // `mark_alive()` 就把 `alive` 置真、`save_protocol` 也协商好了，于是下一次探测
+            // 走进 `if alive` 直接 `return` —— **`pack.list` 再也发不出去**。
+            // 更麻烦的是 `amakano.pack.pending`（断点查询）是挂在 `pack.list` 回包分支里的，
+            // 于是「未完成传输」也一并看不见了。
+            //
+            // 真机复现（2026-09-24 17:10 与 18:12 两次连接）：`hello-ok` 都在 2.04 s 返回，
+            // 两次全程没有任何 `pack.list` 出站，插件日志里 `installed=0`。
+            // 注意它**不是竞态**：`hello-ok` 早到或晚到，两条路都发不出 `pack.list`。
+            //
+            // 同样不在回调里直接发（实测紧跟回包 <10 ms 的那一档丢了 61.5%），隔一拍再发。
+            if first_negotiation {
+                // 首次握手之后要补两件事：**已安装章节列表** + 手环存档。
+                //
+                // ⚠️ **必须串行，而且必须走既有的 `refresh_queue`。**
+                // 这里原来是各自 arm 一个同样 200ms 的定时器 —— 两个定时器同时到点抢**同一个**
+                // 请求坑位（`State::request` 只有一个坑），`saves-list` 先到就把坑占了，
+                // `list` 到点发现 `busy` 就**静默丢掉**，章节列表永远拿不到。
+                //
+                // 真机实证（2026-09-24 20:10）：宿主日志里 `packs-` 命中 **0 次**，
+                // 20:10:05 收到 hello-ok、20:10:07 收到存档列表，然后界面就停在
+                // 「能力协商完成 · 正在读取手环上已安装的章节…」不动，直到用户放弃。
+                //
+                // `refresh_queue` 就是为「一次只挂一个请求」写的现成机制（章节列表在前、
+                // 存档在后，前一个 settle 了再隔一拍发下一个），别再造一份并行定时器。
+                run_refresh(RefreshPlan {
+                    pack_list: true,
+                    save_list: supports_saves && protocol >= SAVE_PROTOCOL,
+                    stats_list: false,
+                });
+            }
+            if first_negotiation && supports_saves && protocol >= SAVE_PROTOCOL {
                 // 协商成功就顺手拉一次存档列表，用户切到「存档」页时数据已经在了。
                 //
                 // ⚠️ **不许在这里直接发**：实测「收到一条回包之后几毫秒内就发出下一个请求」
@@ -1759,11 +2199,10 @@ fn handle_interconnect(payload: &str) -> bool {
                 // 200ms 以上发出的一档几乎不丢。理由与数字见 `src/request.rs` 的 `FOLLOWUP_DELAY_MS`。
                 set_status(StatusKind::Info, "正在读取手环存档…");
                 render();
-                arm_timer(FOLLOWUP_DELAY_MS, json!({ "type": "amakano.timer", "kind": "saves-list" }).to_string());
             }
             // 用户正停在「统计」页、而刚连上时：顺手把统计也读一次，
             // 否则他得再点一下「读取统计」（同样是隔一拍再发，不许在回调里立刻发）。
-            if supports_stats && state().lock().unwrap_or_else(|error| error.into_inner()).page == Page::Stats {
+            if first_negotiation && supports_stats && state().lock().unwrap_or_else(|error| error.into_inner()).page == Page::Stats {
                 arm_timer(FOLLOWUP_DELAY_MS, json!({ "type": "amakano.timer", "kind": "stats-list" }).to_string());
             }
             return false;
@@ -1991,13 +2430,16 @@ fn handle_interconnect(payload: &str) -> bool {
     match message.get("type").and_then(Value::as_str) {
         Some("amakano.files.ready") => {
             let resume_from = message.get("resumeFrom").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let resumed = message.get("resumed").and_then(Value::as_bool).unwrap_or(false);
+            // 权威游标：已写完文件的字节数之和。手环没给（旧版）就退回按分片下标续，
+            // 也就是以前的行为。
+            let resume_bytes = message.get("resumeBytes").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let resumed = message.get("resumed").and_then(Value::as_bool).unwrap_or(false) || resume_bytes > 0;
             let mut should_send = false;
             let mut resumed_now = false;
             let mut next_index = 0;
             update(|state| {
                 if let Some(item) = state.transfer.as_mut() {
-                    apply_ready(item, resume_from, resumed);
+                    apply_ready(item, resume_from, resume_bytes, resumed);
                     resumed_now = item.resumed;
                     next_index = item.next_index;
                     should_send = true;
@@ -2016,26 +2458,59 @@ fn handle_interconnect(payload: &str) -> bool {
                     state.status_kind = StatusKind::Info;
                 });
             }
-            tracing::info!(resume_from, resumed, "received pack ready response");
+            tracing::info!(resume_from, resume_bytes, resumed, "received pack ready response");
             render();
             send_next = should_send;
         }
         Some("amakano.files.chunk-ok") => {
-            let index = message.get("index").and_then(Value::as_u64).unwrap_or(u64::MAX) as usize;
+            // 确认到达。手环在批量模式下会把 `index` 直接给成**累计已写位点**，并附上
+            // `upToIndex`（同值）；旧手环没有 `upToIndex`，退化成「只销这一个」的旧行为。
+            //
+            // 按累计位点销账是「丢一个确认就整章失败」那条死链的解药：一次确认可以把
+            // 在途的好几片一起销掉，对端不必为每一片都收到一条独立的回包。
+            let single = message.get("index").and_then(Value::as_u64).unwrap_or(u64::MAX) as usize;
+            let up_to = message
+                .get("upToIndex")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(single);
+            let highest = single.max(up_to);
             let mut accepted = false;
             update(|state| {
                 let mut progress = None;
                 if let Some(item) = state.transfer.as_mut() {
-                    if let Some(position) = item.in_flight.iter().position(|(value, _)| *value == index) {
-                        let (_, sent_at) = item.in_flight.remove(position);
+                    // 销掉所有 `index <= highest` 的在途分片（批量确认一次销一批）。
+                    let mut cleared: Vec<(usize, u128)> = Vec::new();
+                    item.in_flight.retain(|(value, sent_at)| {
+                        if *value <= highest {
+                            cleared.push((*value, *sent_at));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if !cleared.is_empty() {
                         let now = now_ms();
+                        // RTT 用**最新销掉的那一片**取样（它离「刚发的包」最近）。
+                        let latest = cleared.iter().map(|(value, _)| *value).max().unwrap_or(highest);
+                        let sent_at = cleared
+                            .iter()
+                            .find(|(value, _)| *value == latest)
+                            .map(|(_, sent_at)| *sent_at)
+                            .unwrap_or(now);
                         let sample = now.saturating_sub(sent_at) as u64;
                         item.rtt_ms = if item.rtt_ms == 0 { sample } else { (item.rtt_ms * 3 + sample) / 4 };
-                        item.acked_bytes += item.chunks[index].bytes;
+                        let mut bytes = 0usize;
+                        for (value, _) in &cleared {
+                            if let Some(chunk) = item.chunks.get(*value) {
+                                bytes += chunk.bytes;
+                            }
+                        }
+                        item.acked_bytes += bytes;
                         if item.speed_window_start == 0 {
                             item.speed_window_start = now;
                         }
-                        item.speed_window_bytes += item.chunks[index].bytes;
+                        item.speed_window_bytes += bytes;
                         let elapsed = now.saturating_sub(item.speed_window_start);
                         if elapsed >= 250 {
                             item.speed_kbps = (item.speed_window_bytes as f64 * 1000.0 / elapsed.max(1) as f64 / 1024.0 * 10.0).round() / 10.0;
@@ -2043,6 +2518,13 @@ fn handle_interconnect(payload: &str) -> bool {
                             item.speed_window_bytes = 0;
                         }
                         item.retry_count = 0;
+                        // 窗口的加法增长：每连续 WINDOW_GROWTH_ACKS 片顺利确认涨 1，
+                        // 上限先回到 INITIAL_WINDOW。重传过一次就重新数（在 retry_packet 里清零）。
+                        item.stable_acks += cleared.len();
+                        if item.stable_acks >= WINDOW_GROWTH_ACKS && item.window_size < INITIAL_WINDOW {
+                            item.window_size += 1;
+                            item.stable_acks = 0;
+                        }
                         let acknowledged = item.next_index.saturating_sub(item.in_flight.len());
                         progress = Some(format!("正在同步 {}/{} · {} 分片", acknowledged, item.chunks.len(), chunk_label(item.chunk_bytes)));
                         accepted = true;
@@ -2056,8 +2538,8 @@ fn handle_interconnect(payload: &str) -> bool {
             if accepted {
                 render();
             }
-            if accepted && (index == 0 || index % 32 == 0) {
-                tracing::info!(index, "received pack chunk acknowledgement");
+            if accepted && (single == 0 || single % 32 == 0) {
+                tracing::info!(index = single, cleared = %highest, "received pack chunk acknowledgement");
             }
             send_next = accepted;
         }
@@ -2082,15 +2564,38 @@ fn handle_interconnect(payload: &str) -> bool {
             return false;
         }
         Some("amakano.files.error") => {
-            let error = message.get("error").and_then(Value::as_str).unwrap_or("unknown").to_string();
+            // 手环回的 `error` 是**码**（`size` / `base64` / `write` / `window` …），
+            // 以前直接把它拼进状态行给用户看 —— 那是给机器看的，用户读不懂。
+            // 现在交给 `ErrorCode` 映射成人话 + 「怎么办」，原文放到细节里。
+            let raw = message.get("error").and_then(Value::as_str).unwrap_or("unknown").to_string();
+            // 手环把细节拼在同一串里（`write-301` / `size-…`），所以先按整串认，
+            // 认不出来再按第一个 `-` 之前那段认；仍然认不出才是 Unknown。
+            // （`resume-not-at-file-start` 这类带 `-` 的完整码在整串那一步就命中。）
+            let code = match ErrorCode::from_wire(&raw) {
+                ErrorCode::Unknown => ErrorCode::from_wire(raw.split('-').next().unwrap_or(&raw)),
+                known => known,
+            };
+            let detail = message
+                .get("detail")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| raw.clone());
+            tracing::warn!(raw = %raw, ?code, "band rejected the import");
             update(|state| {
                 if let Some(transfer) = state.transfer.as_mut() {
                     transfer.started = false;
                     transfer.waiting_ready = false;
                     transfer.in_flight.clear();
                 }
-                state.status = format!("手表导入失败：{error}。重新点「继续同步」会从断点接着传");
+                state.error = Some(ErrorView::new(code, detail));
+                state.stage = state.stage.min(SessionStage::AppAlive);
+                state.status = format!("{}：{}", code.label(), code.advice());
                 state.status_kind = StatusKind::Bad;
+                // 失败之后把「正在传」放开，章节按钮重新可点（`pack_meta` 也要清，
+                // 否则那一章会停在「传输中」徽章上 —— 真机踩过）。
+                state.transfer = None;
+                state.pack_meta = None;
+                state.pack_files = Vec::new();
             });
             render();
             return false;
@@ -2454,6 +2959,7 @@ fn handle_action(action: Action) {
         }
         Action::AutoLaunch(enabled) => {
             update(|state| state.auto_launch = enabled);
+            save_persisted();
             set_status(
                 StatusKind::Info,
                 if enabled {
@@ -2762,6 +3268,13 @@ impl event::Guest for ImportPlugin {
                 astrobox_ng_wit::block_on(async { handle_timer(&inner).await });
             }
         }
+        // 自动重连：**必须在所有 block_on 之外**。`connect_device()` 自己会 block_on，
+        // 在它里面再 block_on 就是嵌套，会把插件的执行器卡死。
+        // 放在这里而不是 Timer 分支里：分片确认那条路也可能走到 `fail_transfer`。
+        if update(|state| std::mem::take(&mut state.reconnect_pending)) {
+            tracing::info!("auto-reconnecting");
+            connect_device();
+        }
         astrobox_ng_wit::spawn(async move {
             let _ = writer.write("accepted".into()).await;
         });
@@ -2800,6 +3313,9 @@ impl lifecycle::Guest for ImportPlugin {
     fn on_load() {
         logger::init();
         tracing::info!("Amakano2 pack importer loaded");
+        // 把上次的分片档位 / 自动打开 / 未传完的队列读回来。
+        // **只恢复偏好**：断点权威在手环，这里读不到也不会导致从头传。
+        load_persisted();
         let version = plugin_version();
         update(|state| state.version = version.clone());
         match load_library() {
@@ -2813,6 +3329,7 @@ impl lifecycle::Guest for ImportPlugin {
             }
             Err(message) => {
                 tracing::error!(%message, "chapter pack library unavailable");
+                set_error(ErrorCode::BadPack, &message);
                 update(|state| {
                     state.library_error = message;
                     state.status = "插件内的章节包不可用".into();
@@ -2955,6 +3472,41 @@ mod tests {
         // 槽位上限只是「导入时别写失控」的防御，界面也拿它做「x / N 槽」的显示。
         assert_eq!(MAX_SAVE_SLOTS, 20);
         assert_eq!(amakano2_ui::MAX_SLOTS, MAX_SAVE_SLOTS, "界面与插件的槽位上限必须一致");
+    }
+
+    /// 断点游标 → 分片下标的换算。挂在 crate 根（不是 wasm-only 的 host 模块）就是为了
+    /// 能在宿主机上直接跑这几条 —— 「换档之后从哪一片接上」是能直接判定对错的语义。
+    ///
+    /// 注意游标的语义：`done_bytes` 是**已写完文件的字节数之和**，所以它只会落在文件边界上
+    /// （手环不会报「半个文件」的字节数）。三条文件：A=6+4、B=5、C=3。
+    #[test]
+    fn resume_index_maps_bytes_to_the_current_layout() {
+        let layout = [(6usize, true), (4, false), (5, true), (3, true)];
+        assert_eq!(crate::resume_index_for_bytes(&layout, 0), 0, "游标 0 = 从头");
+        assert_eq!(crate::resume_index_for_bytes(&layout, 10), 2, "A 写完 → B 的第一片");
+        assert_eq!(crate::resume_index_for_bytes(&layout, 15), 3, "B 也写完 → C 的第一片");
+        assert_eq!(crate::resume_index_for_bytes(&[], 10), 0, "空布局不 panic");
+        // 结果永远落在文件边界上（`append: false` 的那一片）。
+        for done in [10usize, 15] {
+            let index = crate::resume_index_for_bytes(&layout, done);
+            assert!(layout[index].1, "游标 {done} 的换算结果必须落在文件边界上");
+        }
+    }
+
+    /// 换分片档位之后，同一个字节游标在两套布局里指向的是**同一个文件**，
+    /// 但分片下标不同 —— 这正是「不能按下标续传、必须按字节游标」的依据，
+    /// 也是「换档最多重传一个文件」而不是整章重来的依据。
+    #[test]
+    fn resume_index_follows_the_cursor_across_a_chunk_size_change() {
+        // 同一个包：文件 A = 8192 字节，文件 B = 1024 字节。
+        let coarse = [(8192usize, true), (1024, true)]; // 8 KB 档：A 一片、B 一片
+        let fine = [(4096usize, true), (4096, false), (1024, true)]; // 4 KB 档：A 两片、B 一片
+        let a = crate::resume_index_for_bytes(&coarse, 8192);
+        let b = crate::resume_index_for_bytes(&fine, 8192);
+        assert_eq!(a, 1, "8 KB 档下 B 从第 1 片开始");
+        assert_eq!(b, 2, "4 KB 档下 B 从第 2 片开始");
+        assert!(coarse[a].1 && fine[b].1, "两套布局里都落在文件边界上");
+        assert_ne!(a, b, "两套布局的下标本来就不该相等 —— 这正是不能按下标续传的原因");
     }
 
     #[test]

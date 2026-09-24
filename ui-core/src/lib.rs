@@ -11,6 +11,7 @@
 //! 3. **好换**：宿主 UI 接口（现在是 `ui-v3`）以后迭代，只需要改插件侧那一个转换函数。
 
 mod actions;
+mod errors;
 mod fixture;
 mod glass;
 mod node;
@@ -20,6 +21,7 @@ mod snapshot;
 mod theme;
 
 pub use actions::{Action, RefreshPlan, RefreshStep, parse as parse_action, refresh_steps};
+pub use errors::{ErrorCode, ErrorView};
 pub use node::{Node, Tag};
 pub use saves::{BAND_SAVES_FIXTURE, BandSaves, band_envelope, band_rows};
 #[cfg(not(target_arch = "wasm32"))]
@@ -27,7 +29,7 @@ pub use saves::BAND_SAVES_FIXTURE_PATH;
 pub use snapshot::{
     CHUNK_OPTIONS, DeviceView, InstalledView, Limits, LogFilter, LogLevel, LogLine, MAX_SLOTS,
     PackView, Page, ReadingStatsView, RecentDayView, ResumeView, SaveError, SaveExportView,
-    SaveImportView, SaveSlotView, Snapshot, StatusKind, TransferView, auto_save_row, chunk_label,
+    SaveImportView, SaveSlotView, SessionStage, Snapshot, StatusKind, TransferView, auto_save_row, chunk_label,
     manual_save_count, missing_save_count,
 };
 pub use theme::PRESS_TIMEOUT_MS;
@@ -122,6 +124,11 @@ pub fn demo() -> Snapshot {
     });
 
     Snapshot {
+        // 预览夹具：展示「已连上、章节列表也拿到了」这一档（分段条 6/7），
+        // 这样界面树导出后能直接看到进度条的点亮效果。
+        stage: SessionStage::CatalogReady,
+        error: None,
+        installed_broken: Vec::new(),
         page: Page::Overview,
         version: demo_version(),
         device: DeviceView {

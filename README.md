@@ -41,14 +41,16 @@
 > 装得下时整条居中，装不下时只滚不裁。改标签 / 加页之前请先量（`tools/README.md`「导航条宽度实测」），
 > 见 `docs/插件开发注意事项.md` 6.13。
 
-当前 `manifest.json`：`version 0.7.0` / `api_level 2` / `wasi_version 2`，`additional_files` 只有 15 个 `packs/pXX.pack` + `packs/index.json`（**没有 `assets/`**，随包文件共 16 个）。当前产物 `dist/amakano2-import-0.7.0.abp`：**17,975,962 字节（17.14 MB）**，19 个条目 = 16 个随包文件 + `entry`（`amakano2_import.wasm`，1,186,800 字节）+ `icon.png` + `manifest.json`；`dist/amakano2-import.abp` 是同一份（不带版本号的当前包）。`0.6.0` 及更早的副本都是**七页重构之前**的产物，别拿来验收新界面。
+当前 `manifest.json`：`version 1.5.1` / `api_level 2` / `wasi_version 2`，`additional_files` 只有 15 个 `packs/pXX.pack` + `packs/index.json`（**没有 `assets/`**，随包文件共 16 个）。当前产物 `dist/amakano2-import-1.5.1.abp`：**17,995,175 字节（17.16 MB）**，19 个条目 = 16 个随包文件 + `entry`（`amakano2_import.wasm`，1,246,835 字节，md5 `fef5ea36c9259eb46f032f471d73b5ab`）+ `icon.png` + `manifest.json`（19 个条目 CRC 全通过）；`dist/amakano2-import.abp` 是同一份（不带版本号的当前包）。`0.7.0` 及更早的副本都是**七页重构之前**的产物，别拿来验收新界面。
+
+上架走的是 AstroBox V2 官方插件源（[`AstralSightStudios/AstroBox-NG-Plugin-Repo`](https://github.com/AstralSightStudios/AstroBox-NG-Plugin-Repo)）：本仓库根目录的 `index.txt` 写着产物目录 `dist`，它的 raw 基地址已经在官方 `index.txt` 里（作者仓库无需再提 PR）。**发新版只要把新的 `dist/` 推到 `main`** —— 官方 Action 每 4 小时重抓一次各仓库的 `manifest.json` 汇总成 `index.json`，客户端市场里显示的就是 `manifest.json` 的 `version`，所以改了界面必须先顺延版本号再打包（否则市场里还是老版本）。
 
 打包（在插件目录下执行，会先 `cargo build --release` 编 wasm，再按 `manifest.json` 的 `additional_files` 收文件打 zip）：
 
 ```powershell
 $env:PYTHON = "C:\Users\<你>\.workbuddy\binaries\python\versions\3.13.12\python.exe"   # 或任意可用的 python.exe
 node ..\..\tools\run-python.js scripts\build_dist.py --release --package
-Copy-Item dist\amakano2-import.abp dist\amakano2-import-0.7.0.abp                      # 按版本留一份副本
+Copy-Item dist\amakano2-import.abp dist\amakano2-import-1.5.1.abp                      # 按版本留一份副本
 ```
 
 ⚠️ 改界面之后**记得先把 `manifest.json` 的 `version` 顺延一位**再打包（插件的版本号是给用户看的那一个，`plugin_version()` 运行时读的就是它）；`tools/bump-version.js` 只管**手环应用**的 `versionCode`，跟插件无关。
