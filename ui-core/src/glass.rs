@@ -29,11 +29,6 @@ pub fn hovered(snapshot: &Snapshot, id: &str) -> bool {
 
 // ---------------------------------------------------------------- 文字零件
 
-/// 主标题（页面主标题、卡片主标题）。
-pub fn title(text: &str) -> Node {
-    label(text, SIZE_TITLE, TEXT_MAIN).weight(650)
-}
-
 /// 元信息：一行里跟在主体后面的小字（`54 分钟 · 736 KB`）。
 pub fn meta(text: impl Into<String>) -> Node {
     label(text, SIZE_TINY, TEXT_DIM)
@@ -137,15 +132,6 @@ pub fn kv_grid(pairs: &[(&str, String)], per_row: usize) -> Node {
         grid = grid.child(row);
     }
     grid
-}
-
-/// 等宽并排的一行砖块（统计格用）。
-pub fn tile_row(tiles: Vec<Node>) -> Node {
-    let mut row = Node::new(Tag::Div).full().row().gap(GAP_SM);
-    for tile in tiles {
-        row = row.child(tile.grow(1.0));
-    }
-    row
 }
 
 // ---------------------------------------------------------------- 交互
@@ -340,25 +326,6 @@ pub fn scrollable_segmented(
         .child(segmented_sized(items, enabled, snapshot, SEGMENT_NARROW_PAD_X, 6))
 }
 
-/// 状态胶囊：一个圆点 + 一句话。
-///
-/// 外面**包一层 row**：胶囊直接挂在纵向卡片上时会被 cross-axis 拉满整行宽
-/// （一颗胶囊变成一条横杠，窄窗截图里一眼就看出来）。包一层之后放在行里、列里都对。
-pub fn status_pill(kind: StatusKind, text: &str) -> Node {
-    let pill = Node::new(Tag::Div)
-        .row()
-        .align("center")
-        .gap(GAP_XS)
-        .pad_x(9)
-        .pad_y(4)
-        .radius(999)
-        .bg(kind.bg())
-        .shrink(0.0)
-        .child(Node::new(Tag::Div).w(6).h(6).radius(999).bg(kind.color()))
-        .child(label(text, SIZE_TINY, kind.color()).weight(500));
-    Node::new(Tag::Div).row().child(pill)
-}
-
 /// 小型状态徽章。
 pub fn state_badge(text: &str, kind: StatusKind) -> Node {
     badge(text, kind.color(), kind.bg())
@@ -382,24 +349,6 @@ pub fn orb(size: u32) -> Node {
     Node::new(Tag::Div).w(size).h(size).shrink(0.0).radius(size / 3).bg(ACCENT_DEEP)
 }
 
-/// 统计块：一个数 + 单位 + 说明，横排三格。
-///
-/// 数字给 20px 而不是上一版的 24px：三格并排时 24px 会把「18.6 MB」挤到换行，
-/// 而这三格是**辅助信息**，不该比页面主标题还大。
-pub fn stat_tile(value: &str, unit: &str, caption: &str, color: &str) -> Node {
-    let big = Node::new(Tag::Div)
-        .row()
-        .align("end")
-        .gap(3)
-        .child(label(value, 20, color).weight(700))
-        .child(label(unit, SIZE_TINY, TEXT_DIM).prop("lh", "1.6"));
-    nested(ROW_RADIUS)
-        .pad(10)
-        .gap(2)
-        .child(big)
-        .child(label(caption, SIZE_TINY, TEXT_DIM))
-}
-
 /// 分段进度条（详见 `node::segmented_bar`）。
 pub fn progress_bar(percent: u32, segments: u32) -> Node {
     super::node::segmented_bar(percent, segments, TRACK, &[ACCENT_LIGHT.to_string(), ACCENT_DEEP.to_string()])
@@ -413,16 +362,6 @@ pub fn progress_bar(percent: u32, segments: u32) -> Node {
 /// （`章节同步 · 插件 v0.8.0`）在「设置 → 关于」里本来就有一份。合成一行之后，
 /// 页面顶部让出的空间正好给内容。版本号不再在这里出现。
 pub fn top_bar(snapshot: &Snapshot) -> Node {
-    let kind = if snapshot.device.connected && snapshot.device.alive {
-        StatusKind::Good
-    } else if snapshot.device.connected {
-        StatusKind::Warn
-    } else if !snapshot.library_error.is_empty() {
-        StatusKind::Bad
-    } else {
-        StatusKind::Info
-    };
-
     panel(CARD_RADIUS)
         .pad(12)
         .row()
@@ -430,10 +369,27 @@ pub fn top_bar(snapshot: &Snapshot) -> Node {
         .gap(GAP)
         .child(brand_mark(snapshot, 28))
         .child(label("甜蜜女友2", 16, TEXT_MAIN).weight(650).grow(1.0))
-        .child(status_pill(kind, &snapshot.head_line()))
+        .child(connection_dot(snapshot))
 }
 
-/// 导航条：七个页面标签，**包在横向滚动区里**，放得下时整条居中。
+/// 顶栏右上角的连接圆点：**只有颜色，不放状态句子**。
+///
+/// 状态句子只有一个出口（任务条的状态区），顶栏再来一颗胶囊就成了第二处播报 ——
+/// 那正是重构前「同一个状态在 4 个地方用 4 套话」的根。圆点只回答「通不通」。
+pub fn connection_dot(snapshot: &Snapshot) -> Node {
+    let color = if snapshot.device.connected && snapshot.device.alive {
+        OK
+    } else if snapshot.device.connected {
+        WARN
+    } else if !snapshot.library_error.is_empty() {
+        BAD
+    } else {
+        TEXT_FAINT
+    };
+    Node::new(Tag::Div).w(8).h(8).shrink(0.0).radius(999).bg(color)
+}
+
+/// 导航条：四个页面标签，**包在横向滚动区里**，放得下时整条居中。
 ///
 /// 内边距压到 4/4：导航条的内边距与每一项的内边距是**相加**的，用默认值会让
 /// 单项装不下两个字（真机预览截图里就是「概/览、章/节」竖着写）。
@@ -449,10 +405,11 @@ pub fn nav_bar(snapshot: &Snapshot) -> Node {
         let mut text = page.label().to_string();
         match page {
             // 徽标只在「有事要做」时出现：装好的章节不再挂一个 0。
-            Page::Library if snapshot.pending_count() > 0 => {
+            Page::Push if snapshot.pending_count() > 0 => {
                 text = format!("{} {}", text, snapshot.pending_count());
             }
-            Page::Logs if snapshot.error_count() > 0 => {
+            // 日志住在设置页：有错误时在那颗 tab 上挂个数，找不到日志的人也能被指过去。
+            Page::Settings if snapshot.error_count() > 0 => {
                 text = format!("{} {}", text, snapshot.error_count());
             }
             _ => {}
@@ -467,22 +424,96 @@ pub fn nav_bar(snapshot: &Snapshot) -> Node {
         .child(segmented_sized(&items, true, snapshot, 4, 4).pad(4))
 }
 
-/// 底部状态行：一个圆点 + 当前状态。
+/// 常驻传输条：正在传输 / 断点续传时显示，挂在页面**底部**、出现在每一页。
 ///
-/// 上一版这里还有第二行「页面说明」（`连接状态、同步进度与下一步建议`）——
-/// 每页的主标题已经说清这一页是什么，那行只是把标题换个说法再说一遍，已删除。
-pub fn footer(snapshot: &Snapshot) -> Node {
-    Node::new(Tag::Div)
-        .full()
-        .row()
-        .align("center")
-        .gap(GAP_XS)
-        .pad_x(4)
-        .child(Node::new(Tag::Div).w(6).h(6).shrink(0.0).radius(999).bg(snapshot.status_kind.color()))
-        .child(label(&snapshot.status, SIZE_TINY, snapshot.status_kind.color()).grow(1.0))
+/// 只要还在传（或有断点/待续），它就一直在 —— 用户点完「同步」往往会切去看存档/统计，
+/// 进度不能再只活在某一个页面里。
+fn transfer_strip(snapshot: &Snapshot) -> Option<Node> {
+    if let Some(transfer) = snapshot.transfer.as_ref().filter(|transfer| transfer.started) {
+        let marker = state_badge(
+            if transfer.ready {
+                "等待手环确认"
+            } else if transfer.resumed {
+                "断点续传"
+            } else {
+                "传输中"
+            },
+            if transfer.shaky() { StatusKind::Warn } else { StatusKind::Good },
+        );
+        let head = Node::new(Tag::Div)
+            .full()
+            .row()
+            .align("center")
+            .gap(GAP_SM)
+            .child(label(&transfer.chapter, SIZE_SMALL, TEXT_MAIN).weight(600).grow(1.0))
+            .child(label(format!("{}%", transfer.percent), SIZE_SMALL, ACCENT).weight(700).shrink(0.0))
+            .child(marker);
+        let queue = snapshot.queue.len();
+        let meta_line = if queue > 0 {
+            format!("{} · 剩余 {} · 队列 {} 章", transfer.speed_label(), transfer.eta_label(), queue)
+        } else {
+            format!("{} · 剩余 {}", transfer.speed_label(), transfer.eta_label())
+        };
+        return Some(
+            panel(CARD_RADIUS)
+                .pad(10)
+                .gap(GAP_XS)
+                .child(head)
+                .child(progress_bar(transfer.percent, 24))
+                .child(meta(meta_line)),
+        );
+    }
+    snapshot.resume.as_ref().map(|resume| {
+        let head = Node::new(Tag::Div)
+            .full()
+            .row()
+            .align("center")
+            .gap(GAP_SM)
+            .child(label(&resume.chapter, SIZE_SMALL, TEXT_MAIN).weight(600).grow(1.0))
+            .child(label(format!("{}%", resume.percent), SIZE_SMALL, WARN).weight(700).shrink(0.0))
+            .child(state_badge("上次没传完", StatusKind::Warn));
+        panel(CARD_RADIUS)
+            .pad(10)
+            .gap(GAP_XS)
+            .child(head)
+            .child(progress_bar(resume.percent, 24))
+            .child(meta("断点还在手环上；去「概览」点「接着传」继续。"))
+    })
 }
 
-/// 页面外壳：顶栏 + 导航 + 内容 + 底部状态行。
+/// 顶部常驻设备条：**连接状态与主操作的唯一出口**，固定在任何页面最上方
+/// （顶栏之下、导航之上）。
+///
+/// 用户实机反馈「连接设备放在最底部看不见」，所以它搬到这里并常驻。
+/// 主操作按会话状态挑一件最要紧的事：没连 → 连接设备；连上但应用还没醒 → 重新连接；
+/// 都就绪 → 打开游戏（就绪态的主操作）。
+pub fn device_bar(snapshot: &Snapshot) -> Node {
+    let (action, text) = if snapshot.device.connected && snapshot.device.alive {
+        (super::actions::LAUNCH, "打开游戏")
+    } else if snapshot.device.connected {
+        (super::actions::CONNECT, "重新连接")
+    } else {
+        (super::actions::CONNECT, "连接设备")
+    };
+    let status = if snapshot.status.is_empty() { snapshot.head_line() } else { snapshot.status.clone() };
+    // 正在连接时把连接进度导轨也放在这条里 —— 它同样是「设备相关内容」，要常驻在最上方。
+    let mut band = panel(CARD_RADIUS).pad(10).gap(GAP_SM);
+    if snapshot.device.connected && !snapshot.device.alive {
+        band = band.child(session_steps(snapshot.stage));
+    }
+    band.child(
+        Node::new(Tag::Div)
+            .full()
+            .row()
+            .align("center")
+            .gap(GAP)
+            .child(Node::new(Tag::Div).w(6).h(6).shrink(0.0).radius(999).bg(snapshot.status_kind.color()))
+            .child(label(status, SIZE_TINY, snapshot.status_kind.color()).grow(1.0))
+            .child(primary_button(text, action, true, snapshot)),
+    )
+}
+
+/// 页面外壳：顶栏 + **设备条（常驻在最上方）** + 导航 + 内容（+ 有传输时的底部传输条）。
 ///
 /// 三件事都是**用户实机反馈后定下来的**，改之前先读这里：
 ///
@@ -495,15 +526,19 @@ pub fn footer(snapshot: &Snapshot) -> Node {
 ///    真机很卡（宿主每次渲染重建子树，两帧之间插不进过渡），已整块撤掉 ——
 ///    所以外壳里**不许再出现** `transform` / `opacity` / `transition`，单测盯着这一条。
 pub fn shell(snapshot: &Snapshot, content: Node) -> Node {
-    Node::new(Tag::Div)
+    let mut root = Node::new(Tag::Div)
         .full()
         .column()
         .gap(GAP_LG)
         .pad_y(PAGE_PAD_Y)
         .child(top_bar(snapshot))
+        .child(device_bar(snapshot))
         .child(nav_bar(snapshot))
-        .child(content)
-        .child(footer(snapshot))
+        .child(content);
+    if let Some(strip) = transfer_strip(snapshot) {
+        root = root.child(strip);
+    }
+    root
 }
 
 #[cfg(test)]
@@ -553,9 +588,11 @@ mod tests {
         assert!(!root.has("transition"), "外壳不许再挂切页过渡");
         assert!(!root.has("opacity"), "外壳不许再切成半透明");
 
-        // 顶栏 + 导航 + 内容（**直接是子节点**，不再包「舞台」层）+ 底部状态行。
+        // 顶栏 + 设备条 + 导航 + 内容（都是外壳的直接子节点；传输条只在有传输时追加）。
         assert_eq!(root.children.len(), 4);
-        assert_eq!(root.children[2].get("marker"), Some("content"), "内容必须是外壳的直接子节点");
+        assert_eq!(root.children[3].get("marker"), Some("content"), "内容必须是外壳的直接子节点");
+        // 设备条必须排在导航之前（常驻在页面最上方）。
+        assert!(root.children[1].texts().contains(&"连接设备"), "设备条要在导航之上");
     }
 
     /// 顶栏压成一行：品牌方块 + 名称 + 状态胶囊，**不再有版本副标题**。
@@ -571,14 +608,43 @@ mod tests {
         assert!(!bar.texts().iter().any(|text| text.contains("插件 v")), "{:?}", bar.texts());
     }
 
-    /// 底部状态行只有一行：状态。上一版第二行的「页面说明」已删除。
+    /// 设备条是**唯一的状态出口**，而且常驻在页面最上方（顶栏之下、导航之上）。
     #[test]
-    fn footer_is_a_single_status_line() {
+    fn device_bar_is_the_single_status_outlet_and_sits_above_the_nav() {
         let mut snapshot = Snapshot::default();
         snapshot.status = "已连接手环".into();
-        let bar = footer(&snapshot);
-        assert_eq!(bar.texts(), vec!["已连接手环"], "状态行只说状态，不再重复页面说明");
-        assert_eq!(bar.get("pb"), None, "两行改一行之后不再需要额外的下内边距");
+        let bar = device_bar(&snapshot);
+        let texts = bar.texts();
+        assert_eq!(texts.iter().filter(|text| **text == "已连接手环").count(), 1, "{texts:?}");
+        assert!(texts.contains(&"连接设备"), "没连手环时主操作是连接设备：{texts:?}");
+    }
+
+    /// 传输中：底部常驻传输条（章节 + 百分比 + 队列）与顶部设备条同时存在。
+    #[test]
+    fn transfer_strip_stays_persistent_with_device_bar_on_top() {
+        let snapshot = crate::demo();
+        let root = shell(&snapshot, Node::new(Tag::Div));
+        let texts = root.texts();
+        assert!(texts.iter().any(|text| *text == "33%"), "传输条要常驻显示百分比：{texts:?}");
+        assert!(texts.iter().any(|text| text.contains("队列")), "要带上队列：{texts:?}");
+        assert!(texts.contains(&"打开游戏"), "设备条与传输条要同时存在：{texts:?}");
+    }
+
+    /// 「传输显示常驻」的可测定义：传输中，**每一页**的外壳都渲染同一条传输条。
+    ///
+    /// 这条守的是用户的原始要求「传输时那个传输显示要常驻」：进度不能只在某一页出现。
+    #[test]
+    fn every_page_keeps_the_transfer_strip() {
+        let mut snapshot = crate::demo();
+        for page in Page::ALL {
+            snapshot.page = page;
+            let tree = crate::pages::render(&snapshot);
+            let texts = tree.texts();
+            assert!(
+                texts.iter().any(|text| *text == "33%"),
+                "{page:?} 页丢了常驻传输条：{texts:?}"
+            );
+        }
     }
 
     #[test]
@@ -747,36 +813,20 @@ mod tests {
             active: false,
         }];
         let texts = nav_bar(&snapshot).texts().join(" | ");
-        assert!(!texts.contains("章节 0"), "全都装好时不该挂一个 0：{texts}");
-        assert!(!texts.contains("日志 0"), "没有错误时不该挂一个 0：{texts}");
+        assert!(!texts.contains("推送 0"), "全都装好时不该挂一个 0：{texts}");
+        assert!(!texts.contains("设置 0"), "没有错误时不该挂一个 0：{texts}");
 
         snapshot.log_errors = 2;
-        assert!(nav_bar(&snapshot).texts().iter().any(|text| *text == "日志 2"));
+        assert!(nav_bar(&snapshot).texts().iter().any(|text| *text == "设置 2"));
     }
 
-    /// 状态胶囊外面包了一层 row：挂在纵向卡片上时不会被 cross-axis 拉满整行
-    /// （一颗胶囊变成一条横杠 —— 设备页那张实时状态条上一版就是这样）。
+    /// 区块标签用次文色：一个卡片里不许有两个都在喊「看我」的标题。
     #[test]
-    fn status_pill_keeps_its_capsule_width() {
-        let outer = status_pill(StatusKind::Good, "《甜蜜女友2》正在响应");
-        assert_eq!(outer.children.len(), 1, "外层只是定位用的一行，里面才是胶囊");
-        assert!(!outer.has("bg"), "外层容器自己不填色");
-        let pill = &outer.children[0];
-        assert_eq!(pill.get("radius"), Some("999"));
-        assert_eq!(pill.get("shrink"), Some("0"), "胶囊宽度只由内容决定");
-        assert_eq!(pill.get("bg"), Some(StatusKind::Good.bg()));
-    }
-
-    /// 区块标签比主标题暗一档：一个卡片里不许有两个都在喊「看我」的标题。
-    #[test]
-    fn group_label_is_dimmer_than_the_card_title() {
+    fn group_label_uses_the_secondary_text_color() {
         let card = section("章节列表", Some("15 章".into()));
         let label = card.children[0].children[0].clone();
         assert_eq!(label.get("fg"), Some(TEXT_SUB), "区块标签用次文色");
         assert_eq!(label.get("size"), Some("12"));
-        let main = title("甜蜜女友2");
-        assert_eq!(main.get("fg"), Some(TEXT_MAIN), "主标题用主文色");
-        assert_eq!(main.get("size"), Some("18"));
     }
 }
 

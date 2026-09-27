@@ -1,17 +1,21 @@
-//! 设置页：传输参数、行为开关、缓存、插件信息。
+//! 设置页：传输参数、行为开关、缓存、设备详情、运行日志、插件信息。
 //!
-//! 四块都是**摆事实**：参数是协议里定死的值，缓存是当前占用的字节数，
-//! 关于里是版本与容量。这里没有可点的「优化」按钮 —— 能自动的都自动了。
+//! 这一页吸收了两块原本各自占一个导航位的内容：**设备详情**（原「设备」页）与**运行日志**
+//! （原「日志」页）。它们都是低频的「事实 / 排障」，不值得各占一个 tab。
+//! 连接与重新连接的操作**不在这里** —— 那是任务条状态区的事（单一出口），
+//! 本页只如实显示设备是谁、手环端版本多少。
 //!
 //! 临时自检卡（渲染自检、存档功能自检）**都已删除**，结论落在
 //! `docs/插件开发注意事项.md`，别再往这一页加实验装置。
 
 use super::super::actions;
-use super::super::glass::{ghost_button, kv_grid, note, section, segmented};
-use super::super::node::{Node, Tag, label};
-use super::super::snapshot::{chunk_label, Snapshot, CHUNK_OPTIONS};
-use super::super::theme::*;
+use super::super::glass::{empty, ghost_button, kv_grid, note, quiet_button, section, segmented};
 use super::super::human_bytes;
+use super::super::node::{Node, Tag, badge, label};
+use super::super::snapshot::{chunk_label, LogFilter, LogLine, Snapshot, CHUNK_OPTIONS};
+use super::super::theme::*;
+
+const LOG_MAX_HEIGHT: u32 = 360;
 
 pub fn render(snapshot: &Snapshot) -> Node {
     Node::new(Tag::Div)
@@ -21,10 +25,12 @@ pub fn render(snapshot: &Snapshot) -> Node {
         .child(chunk_settings(snapshot))
         .child(behavior(snapshot))
         .child(cache(snapshot))
+        .child(device(snapshot))
+        .child(logs(snapshot))
         .child(about(snapshot))
 }
 
-/// 传输分片与协议参数。**分片档位只有这一个入口**（原先传输页里还有一份，已删）。
+/// 传输分片与协议参数。**分片档位只有这一个入口**。
 fn chunk_settings(snapshot: &Snapshot) -> Node {
     let busy = snapshot.is_transferring();
     let items: Vec<(String, String, bool)> = CHUNK_OPTIONS
@@ -34,8 +40,6 @@ fn chunk_settings(snapshot: &Snapshot) -> Node {
     let limits = &snapshot.limits;
 
     // 两栏并排时每格只有 ~170px：**值一定要短**，长了就会折成两行把小字挤乱。
-    // 超时是**按请求种类**定的（存档比章节列表宽，理由见 `src/request.rs`），
-    // 所以拆成两格各自报一个数字，别在一格里写括号说明。
     let grid = kv_grid(
         &[
             ("请求超时", format!("{} ms", limits.request_timeout_ms)),
@@ -78,6 +82,96 @@ fn cache(snapshot: &Snapshot) -> Node {
         .child(ghost_button("清理未完成缓存", actions::CLEAR_CACHE, snapshot.cache_files > 0, snapshot))
 }
 
+/// 设备详情。**只摆事实，不放连接 / 打开游戏按钮**（那在任务条的状态区）。
+fn device(snapshot: &Snapshot) -> Node {
+    let name = if snapshot.device.name.is_empty() {
+        "尚未选择手环".to_string()
+    } else {
+        snapshot.device.name.clone()
+    };
+    let addr = if snapshot.device.addr.is_empty() { "—".to_string() } else { snapshot.device.addr.clone() };
+    let band = if snapshot.band_version.is_empty() {
+        "未知".to_string()
+    } else {
+        snapshot.band_version.clone()
+    };
+    let protocol = match snapshot.save_protocol {
+        Some(version) => format!("v{version}"),
+        None => "未协商".to_string(),
+    };
+    let grid = kv_grid(
+        &[("设备", name), ("地址", addr), ("手环端版本", band), ("存档协议", protocol)],
+        2,
+    );
+
+    section("设备与连接", None)
+        .child(grid)
+        .child(note("连接 / 重新连接 / 打开游戏都在底部的任务条上。"))
+}
+
+/// 运行日志（原「日志」页）。
+fn logs(snapshot: &Snapshot) -> Node {
+    let lines = snapshot.filtered_logs();
+    let hint = if snapshot.log_errors > 0 {
+        format!("{} 行 · {} 个错误", lines.len(), snapshot.log_errors)
+    } else {
+        format!("{} 行", lines.len())
+    };
+
+    let mut list = Node::new(Tag::Scroll).full().scroll("y").maxh(LOG_MAX_HEIGHT).column().gap(4);
+    if lines.is_empty() {
+        list = list.child(empty(if snapshot.logs.is_empty() { "还没有日志" } else { "当前筛选下没有日志" }));
+    } else {
+        for line in &lines {
+            list = list.child(log_row(line));
+        }
+    }
+
+    section("运行日志", Some(hint))
+        .child(log_controls(snapshot))
+        .child(list)
+        .child(label("只留最近一段。出问题时把这一页截图发给作者，比复述状态行管用。", SIZE_TINY, TEXT_DIM))
+}
+
+/// 级别筛选 + 清空。
+fn log_controls(snapshot: &Snapshot) -> Node {
+    let items: Vec<(String, String, bool)> = LogFilter::ALL
+        .into_iter()
+        .map(|filter| {
+            let count = match filter {
+                LogFilter::All => snapshot.logs.len(),
+                LogFilter::Warn => snapshot.log_warns,
+                LogFilter::Error => snapshot.log_errors,
+            };
+            let text = if count > 0 { format!("{} {count}", filter.label()) } else { filter.label().to_string() };
+            (text, actions::log_filter_id(filter), snapshot.log_filter == filter)
+        })
+        .collect();
+
+    Node::new(Tag::Div)
+        .full()
+        .row()
+        .align("center")
+        .justify("between")
+        .gap(GAP)
+        .child(segmented(&items, true, snapshot))
+        .child(quiet_button("清空", actions::LOG_CLEAR, !snapshot.logs.is_empty(), snapshot))
+}
+
+/// 一行日志：级别标签 + 原文。
+fn log_row(line: &LogLine) -> Node {
+    Node::new(Tag::Div)
+        .full()
+        .row()
+        .align("start")
+        .gap(GAP_SM)
+        .pad(8)
+        .radius(10)
+        .bg(SURFACE_SOFT)
+        .child(badge(line.level.label(), line.level.color(), "rgba(255,255,255,0.07)"))
+        .child(label(&line.text, SIZE_TINY, line.level.color()).grow(1.0).prop("word-break", "break-word"))
+}
+
 /// 关于。
 fn about(snapshot: &Snapshot) -> Node {
     let version = if snapshot.version.is_empty() {
@@ -105,49 +199,34 @@ mod tests {
     use super::*;
     use crate::snapshot::Page;
 
+    /// 设置页该有的块都在（别在改写时把整块删掉），也不许有自检装置。
     #[test]
-    fn settings_page_has_no_experiment_probes_left() {
-        // 本轮把最后一块临时自检（「存档功能自检（临时）」）整块删除：
-        // 结论已经落进 docs/插件开发注意事项.md 第 7 节，实验装置不留常驻。
-        // 谁再往设置页加自检卡，这条会红。
+    fn settings_has_all_sections_and_no_experiment_probes() {
         let mut snapshot = Snapshot::default();
         snapshot.page = Page::Settings;
         let tree = render(&snapshot);
         let texts = tree.texts();
-
-        assert!(!texts.iter().any(|text| text.contains("自检")), "设置页不许再有自检卡：{texts:?}");
-        assert!(!texts.iter().any(|text| text.contains("临时")), "设置页不许再有临时装置：{texts:?}");
-        for action in ["save-probe-dialog", "save-probe-fs"] {
-            assert!(
-                tree.find(|node| node.get("on.click") == Some(action)).is_empty(),
-                "{action} 已经删除，不该还有按钮"
-            );
-        }
-        // 设置页该有的四块还在（别把整页一起删掉了）。
-        for text in ["传输分片", "行为", "未完成缓存", "关于"] {
+        for text in ["传输分片", "行为", "未完成缓存", "设备与连接", "运行日志", "关于"] {
             assert!(texts.contains(&text), "设置页缺少「{text}」：{texts:?}");
         }
+        assert!(!texts.iter().any(|text| text.contains("自检")), "{texts:?}");
+        assert!(!texts.iter().any(|text| text.contains("临时")), "{texts:?}");
+        // 连接 / 打开游戏不在这一页（单一出口）。
+        assert!(tree.find(|node| node.get("on.click") == Some("connect")).is_empty());
+        assert!(tree.find(|node| node.get("on.click") == Some("launch")).is_empty());
     }
 
-    /// 分片档位**只有设置页这一个入口**：传输页撤掉之后，改档位不该再需要跳页。
-    /// 同时把协议参数（超时/重试/窗口）也钉在这里 —— 它们原本跟着分片卡走，
-    /// 别在改写时被顺手丢掉。
+    /// 分片档位只有设置页这一个入口；协议参数也钉在这里。
     #[test]
-    fn chunk_size_is_settable_only_here_and_protocol_limits_stay_visible() {
+    fn chunk_size_and_protocol_limits_stay_visible() {
         let mut snapshot = Snapshot::default();
         snapshot.page = Page::Settings;
         let tree = render(&snapshot);
         let texts = tree.texts();
-
         for option in CHUNK_OPTIONS {
             let id = actions::chunk_id(option);
-            assert_eq!(
-                tree.find(|node| node.get("on.click") == Some(id.as_str())).len(),
-                1,
-                "{id} 应该恰好有一个入口"
-            );
+            assert_eq!(tree.find(|node| node.get("on.click") == Some(id.as_str())).len(), 1, "{id} 应该恰好一个入口");
         }
-        // 协议的几个数字还在页面上（它们是排障时要报的值）。
         for value in ["1000 ms", "1500 ms", "12 次"] {
             assert!(texts.iter().any(|text| text.contains(value)), "缺参数 {value}：{texts:?}");
         }

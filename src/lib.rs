@@ -29,6 +29,26 @@ const MAX_SAVE_SLOTS: usize = 20;
 /// **缺席就等于「手环端应用太旧」**，界面上要给人话而不是超时。
 const SAVE_PROTOCOL: u32 = 1;
 
+/// 标记某个连接会话是否已经处理过首条 `hello-ok`。
+/// 能力协商结果不能作为会话边界：重连后 `save_protocol` 仍可能保留旧值。
+fn mark_first_hello_for_session(session: u64, handled_session: &mut Option<u64>) -> bool {
+    if *handled_session == Some(session) {
+        return false;
+    }
+    *handled_session = Some(session);
+    true
+}
+
+/// 存档通道「被版本/协议卡住」的判据：**应用已经活着**（答过至少一条 interconnect 消息），
+/// 却仍然没有协商出存档协议。
+///
+/// 少了「已经活着」这半边，连接后那几秒（应用还在启动、hello 还没人接）就会被误报成
+/// 「两侧版本或协议对不上」—— 真机日志里 `hello sent` 紧跟在 `launched watch app` 之后
+/// 1.7 ms，随后 6 秒内一条回包都没有，正是这个假红卡的来源。
+fn saves_capability_missing(alive: bool, save_protocol: Option<u32>) -> bool {
+    alive && save_protocol.is_none()
+}
+
 /// 把「已写完的字节数」换算成**当前分片布局下**的分片下标。
 ///
 /// `layout` 是每个分片的 `(字节数, 是不是某个文件的第一片)`。
@@ -83,7 +103,10 @@ use zip::ZipArchive;
 use crate::request::{FOLLOWUP_DELAY_MS, PendingRequest, RequestKind, Slot, TimeoutAction};
 use crate::saves;
 use crate::saves::now_ms;
-use crate::{MAX_SAVE_SLOTS, SAVE_PROTOCOL, resume_index_for_bytes};
+use crate::{
+    MAX_SAVE_SLOTS, SAVE_PROTOCOL, mark_first_hello_for_session, resume_index_for_bytes,
+    saves_capability_missing,
+};
 
 // 宿主专属的两个模块：界面转换与剪贴板（都碰 `astrobox_ng_wit`）。
 //
@@ -215,10 +238,17 @@ struct State {
     /// 手环应用已经回应过消息（说明《甜蜜女友2》正在前台运行）。
     alive: bool,
     probe_attempt: u32,
+    /// 本次连接里 `send_qaic_message` 失败的次数。**这个数字必须能看见**：
+    /// 「应用打开了、插件却一条回包都收不到」有两种可能 —— 消息根本没发出去（宿主侧拒绝）
+    /// 或者发出去了但应用没回。失败次数是区分两者的唯一现场证据，所以发送失败要留痕，
+    /// 并且要在状态行上说出来（旧实现里它会被下一轮探测的「正在等待…」直接盖掉）。
+    send_failures: u32,
     /// 连接会话号。每次「连接设备」+1，探测/心跳定时器的载荷里带着它 ——
     /// 重连之后上一轮残留的定时器回来时会因为对不上号而被丢掉，
     /// 否则会有两条心跳链并行、每轮翻一倍。
     session: u64,
+    /// 本次连接会话是否已经处理过首条 `hello-ok`。不要用能力值代替会话边界。
+    hello_ok_session: Option<u64>,
     /// 稳态心跳连续几次没被回应。到上限就判定掉线并自动重连。
     heartbeat_misses: u32,
     /// 最近一次收到手环任何消息的时刻（`mark_alive()` 刷新）。心跳据此判断「静默了多久」。
@@ -333,7 +363,9 @@ fn state() -> &'static Mutex<State> {
             connected: false,
             alive: false,
             probe_attempt: 0,
+            send_failures: 0,
             session: 0,
+            hello_ok_session: None,
             stage: SessionStage::Idle,
             error: None,
             installed_broken: Vec::new(),
@@ -357,7 +389,7 @@ fn state() -> &'static Mutex<State> {
             request: Slot::idle(),
             refresh_queue: Vec::new(),
             resume: None,
-            page: Page::Overview,
+            page: Page::Push,
             auto_launch: true,
             hover: None,
             line_filter: None,
@@ -787,8 +819,8 @@ fn snapshot() -> Snapshot {
         resume_from: pending.resume_from,
     });
 
-    // 日志行只在日志页才克隆（最多 240 行），别的页面只要级别计数。
-    let logs = if current.page == Page::Logs { logger::snapshot() } else { Vec::new() };
+    // 日志行只在设置页（日志就住在那儿）才克隆（最多 240 行），别的页面只要级别计数。
+    let logs = if current.page == Page::Settings { logger::snapshot() } else { Vec::new() };
     let (log_warns, log_errors) = logger::counts();
 
     Snapshot {
@@ -1075,7 +1107,18 @@ async fn dispatch_request(kind: RequestKind, payload: String, id: String, probe:
     });
     if psys_host::interconnect::send_qaic_message(&addr, PACKAGE_NAME, &payload).await.is_err() {
         clear_request(&id);
-        set_status(StatusKind::Bad, format!("{}失败：无法发送消息，请重新连接设备", kind.label()));
+        let failures = update(|state| {
+            state.send_failures += 1;
+            state.send_failures
+        });
+        // 这条日志是「连不上」的现场证据：宿主返回 Err 说明消息**根本没出去**
+        // （宿主按「设备地址 + 包名」精确匹配，匹配不到就直接失败），
+        // 与「发出去了但应用没回」是完全不同的两件事，别再让两者在界面上长得一样。
+        tracing::warn!(kind = kind.label(), addr = %addr, failures, "interconnect send failed");
+        set_status(
+            StatusKind::Bad,
+            format!("{}失败：消息发不出去（已失败 {failures} 次），请重新连接设备", kind.label()),
+        );
         render();
         return;
     }
@@ -1086,12 +1129,17 @@ async fn dispatch_request(kind: RequestKind, payload: String, id: String, probe:
 
 fn fail_request(kind: RequestKind) {
     // 存档通道：手动打开应用也不会让它长出存档支持，所以失败的归因先看「协议协商出来了没有」。
-    // 没协商出来 = 手环端应用太旧 → 只置 `saves_unsupported` 状态位；
-    // 那句「手环端应用版本过旧」的**结论**与**怎么办**由界面统一渲染
-    // （ui-core 的 `saves_blocked_hint` / `saves_blocked_action`），这里不再写第二遍 ——
-    // 否则用户会在同一张卡上看到两句几乎一样的提示（实机截图就是这么来的）。
-    let saves_blocked = kind.is_saves()
-        && state().lock().unwrap_or_else(|error| error.into_inner()).save_protocol.is_none();
+    // **但必须先确认应用已经活着**（`saves_capability_missing` 的 alive 那一半）：
+    // 应用还没醒时的同款超时只是「手环没有响应」，不能替用户下「版本过旧」的结论。
+    // 真判成版本问题时只置 `saves_unsupported` 状态位；那句「手环端应用版本过旧」的
+    // **结论**与**怎么办**由界面统一渲染（ui-core 的 `saves_blocked_hint` /
+    // `saves_blocked_action`），这里不再写第二遍 —— 否则用户会在同一张卡上看到
+    // 两句几乎一样的提示（实机截图就是这么来的）。
+    let (alive, save_protocol) = {
+        let current = state().lock().unwrap_or_else(|error| error.into_inner());
+        (current.alive, current.save_protocol)
+    };
+    let saves_blocked = kind.is_saves() && saves_capability_missing(alive, save_protocol);
     // 统计通道「被版本卡住」= 协议已经协商出来了，但能力表里没有 stats。
     let stats_blocked = matches!(kind, RequestKind::StatsList)
         && {
@@ -1431,6 +1479,7 @@ fn connect_device() {
             state.device_name = name;
             state.alive = false;
             state.probe_attempt = 0;
+            state.send_failures = 0;
             // 新会话：上一轮残留的探测/心跳定时器就此作废（见 `session` 字段的说明）。
             state.session = state.session.wrapping_add(1);
             // 重新连接就把进度条**重置**：分段条说的是「这一次走到哪了」，
@@ -1475,9 +1524,10 @@ fn connect_device() {
         tracing::info!(?hint, "connect finished");
         // 先给应用 2 秒启动时间，然后按固定间隔轮询；手动打开也能接上。
         arm_probe(APP_START_DELAY_MS, update(|state| state.session));
-        // 通道建立后顺手问一次存档能力：`hello-ok` 缺席就等于「手环端应用太旧」。
-        // 探测循环随后仍会照旧发 pack.list（那是既有链路，不动它）。
-        request_hello().await;
+        // **能力协商（amakano.app.hello）不在这里发。** 应用刚被 `launch-qa` 拉起、还没注册
+        // interconnect 监听，这时发出去的 hello 只会全部落空；三次重试用完（3×2 秒）就会把
+        // 「应用还没醒」误判成「手环端应用版本过旧」。改由 `probe_tick` 在应用**答过消息**
+        // 之后发出 —— 那时 `hello-ok` 缺席才真是版本问题。
     });
 }
 
@@ -1638,9 +1688,16 @@ async fn request_save_activate(slot: usize) {
 /// 就此终止，之后掉线、手环应用被杀都发现不了，要等用户下一次操作才暴露。
 /// 现在这个分支改成挂**较长的**心跳间隔，并由心跳判定掉线。
 async fn probe_tick(session: u64) {
-    let (addr, alive, attempt, busy, last_alive) = {
+    let (addr, alive, attempt, busy, last_alive, save_protocol) = {
         let current = state().lock().unwrap_or_else(|error| error.into_inner());
-        (current.device_addr.clone(), current.alive, current.probe_attempt, current.request.busy(), current.last_alive_ms)
+        (
+            current.device_addr.clone(),
+            current.alive,
+            current.probe_attempt,
+            current.request.busy(),
+            current.last_alive_ms,
+            current.save_protocol,
+        )
     };
     if addr.is_empty() {
         return;
@@ -1675,7 +1732,15 @@ async fn probe_tick(session: u64) {
         // `probe = true` 让超时**静默让位**（不重发、不报错），判定完全交给上面的漏拍计数 ——
         // 心跳漏一拍不该弹「手环端应用版本过旧」。
         if !busy {
-            request_heartbeat().await;
+            if save_protocol.is_none() {
+                // 应用已经活着（这条分支只在答过消息之后才走到）却还没协商出存档协议：
+                // 用**非探测**的 hello 再问一次能力 —— 只有它会产出「版本/协议不匹配」的
+                // 结论，应用活着却答不上 hello 才真是版本旧。协商成功之后换回静默心跳，
+                // 别让 10 秒一次的探测反复刷状态。
+                request_hello().await;
+            } else {
+                request_heartbeat().await;
+            }
         }
         arm_probe(HEARTBEAT_INTERVAL_MS, session);
         return;
@@ -1683,22 +1748,65 @@ async fn probe_tick(session: u64) {
     // ── 连接期：密集探测（要尽快接上，所以间隔短） ──
     if !busy {
         if attempt >= MAX_PROBE_ATTEMPTS {
+            let send_failures = update(|state| state.send_failures);
+            tracing::warn!(attempts = attempt, send_failures, "watch app never answered the probes");
+            // 一次都没回：先把手环上装的第三方应用**列出来**（包名 + 版本号）。
+            // 「应用能打开、插件一条回包都收不到」时，第一件要确认的事就是
+            // 「装的是不是本应用、是哪一版」—— 顺带这次调用也会刷新宿主的应用注册表
+            // （真机上按包名直连失败过一次，见 README 的连接行为一节）。
+            //
+            // **必须 spawn**：这一调用要等设备回包，而 `probe_tick` 跑在宿主的事件分发链上 ——
+            // 就地 await 等于赌设备一定回（Dialog 那条教训就是这么来的：等待类宿主调用把
+            // 分发器堵死，之后整个插件点不动）。spawn 出去，回不回都不影响界面。
+            let list_addr = addr.clone();
+            astrobox_ng_wit::spawn(async move { log_installed_apps(&list_addr).await });
             set_status(
                 StatusKind::Bad,
-                format!("等待《甜蜜女友2》回应超时（已试 {MAX_PROBE_ATTEMPTS} 次）。请确认手表上已打开应用，再点「连接设备」重试"),
+                if send_failures > 0 {
+                    format!("消息发不出去（已失败 {send_failures} 次）：请重新连接设备，并确认手环上确实装有《甜蜜女友2》")
+                } else {
+                    format!("等待《甜蜜女友2》回应超时（已试 {MAX_PROBE_ATTEMPTS} 次）。请确认手环上已打开应用且**停在《甜蜜女友2》页面**（切走或熄屏它就收不到消息），再点「连接设备」重试")
+                },
             );
             render();
             return;
         }
         update(|state| {
             state.probe_attempt = attempt + 1;
-            state.status = format!("正在等待《甜蜜女友2》回应…（{}/{MAX_PROBE_ATTEMPTS}）", attempt + 1);
-            state.status_kind = StatusKind::Info;
+            if state.send_failures > 0 {
+                // 发送失败是**硬故障**：它不该被下一句「正在等待回应」盖掉。
+                state.status = format!("消息发不出去（已失败 {} 次）：请重新连接设备", state.send_failures);
+                state.status_kind = StatusKind::Bad;
+            } else {
+                state.status = format!("正在等待《甜蜜女友2》回应…（{}/{MAX_PROBE_ATTEMPTS}）", attempt + 1);
+                state.status_kind = StatusKind::Info;
+            }
         });
         render();
         request_pack_list(true).await;
     }
     arm_probe(PROBE_INTERVAL_MS, session);
+}
+
+/// 把手环上装的第三方快应用（包名 + 版本号）记进日志，并在装了本应用时回一句结论。
+///
+/// 用途只有一个：**给「应用打开了却一条回包都收不到」留证据**。连着探测 12 次都没回包时，
+/// 必须能回答「手环上装的到底是不是本应用、是哪一版」—— 这个问题不能靠猜，
+/// 也不能让「应用没装/装了旧版」和「装了但没在跑」在界面上长得一模一样。
+async fn log_installed_apps(addr: &str) {
+    match psys_host::thirdpartyapp::get_thirdparty_app_list(addr).await {
+        Ok(apps) => {
+            let summary: Vec<String> = apps
+                .iter()
+                .map(|app| format!("{}({})@{}", app.app_name, app.package_name, app.version_code))
+                .collect();
+            match apps.iter().find(|app| app.package_name == PACKAGE_NAME) {
+                Some(app) => tracing::warn!(version_code = app.version_code, installed = %summary.join("、"), "band third-party app list"),
+                None => tracing::warn!(installed = %summary.join("、"), "band third-party app list: our package is NOT installed"),
+            }
+        }
+        Err(_) => tracing::warn!("band third-party app list unavailable"),
+    }
 }
 
 /// 心跳：用 `amakano.app.hello` 探活（`probe = true`，超时静默）。
@@ -2123,8 +2231,8 @@ fn handle_interconnect(payload: &str) -> bool {
             let supports_stats = features.iter().any(|feature| feature == "stats");
             tracing::info!(protocol, version = %version, version_code, ?features, "band save capability reported");
             set_stage(SessionStage::Handshaked);
-            // `None` = 这次是第一次协商出来（心跳会反复回 hello-ok，别每次都当首次）。
-            let was_negotiated = Some(state().lock().unwrap_or_else(|error| error.into_inner()).save_protocol.is_some());
+            // 以连接会话为边界：能力值可能沿用上一会话，不能用它判断是否首次。
+            let first_hello = update(|state| mark_first_hello_for_session(state.session, &mut state.hello_ok_session));
             update(|state| {
                 state.band_version = version.clone();
                 state.save_protocol = (protocol >= SAVE_PROTOCOL && supports_saves).then_some(protocol);
@@ -2138,6 +2246,12 @@ fn handle_interconnect(payload: &str) -> bool {
                 if state.save_protocol.is_some() {
                     state.saves_error.clear();
                     state.saves_unsupported = false;
+                    // 协商成功 = 之前那张「手环端应用版本过旧 / 两侧版本或协议对不上」被证伪，
+                    // 必须把红卡撤掉：应用启动慢半拍时第一轮 hello 会超时，之后协商成功，
+                    // 卡不撤用户就会在握手已经正常的情况下一直看着「版本或协议不匹配」。
+                    if state.error.as_ref().map(|error| error.code) == Some(ErrorCode::Protocol) {
+                        state.error = None;
+                    }
                     state.status = format!("手环端支持存档管理（应用 v{version} · 协议 {protocol}）");
                     state.status_kind = StatusKind::Good;
                 } else {
@@ -2150,10 +2264,9 @@ fn handle_interconnect(payload: &str) -> bool {
                     state.status_kind = StatusKind::Warn;
                 }
             });
-            // 是不是**首次**协商：心跳也走同一条 `hello`，如果每次回包都补拉列表，
+            // 是不是本次会话的**首条** hello：心跳也走同一条 `hello`，如果每次回包都补拉列表，
             // 10 秒一次的探测就变成「10 秒一次 storage 读 + 10 秒一次注册表重写」，
             // 白搅动手环的内存与闪存。
-            let first_negotiation = was_negotiated == Some(false);
             render();
             // **握手成功 = 手环应用已经活过来了 → 必须补一次章节列表。**
             //
@@ -2169,7 +2282,7 @@ fn handle_interconnect(payload: &str) -> bool {
             // 注意它**不是竞态**：`hello-ok` 早到或晚到，两条路都发不出 `pack.list`。
             //
             // 同样不在回调里直接发（实测紧跟回包 <10 ms 的那一档丢了 61.5%），隔一拍再发。
-            if first_negotiation {
+            if first_hello {
                 // 首次握手之后要补两件事：**已安装章节列表** + 手环存档。
                 //
                 // ⚠️ **必须串行，而且必须走既有的 `refresh_queue`。**
@@ -2189,7 +2302,7 @@ fn handle_interconnect(payload: &str) -> bool {
                     stats_list: false,
                 });
             }
-            if first_negotiation && supports_saves && protocol >= SAVE_PROTOCOL {
+            if first_hello && supports_saves && protocol >= SAVE_PROTOCOL {
                 // 协商成功就顺手拉一次存档列表，用户切到「存档」页时数据已经在了。
                 //
                 // ⚠️ **不许在这里直接发**：实测「收到一条回包之后几毫秒内就发出下一个请求」
@@ -2202,7 +2315,7 @@ fn handle_interconnect(payload: &str) -> bool {
             }
             // 用户正停在「统计」页、而刚连上时：顺手把统计也读一次，
             // 否则他得再点一下「读取统计」（同样是隔一拍再发，不许在回调里立刻发）。
-            if first_negotiation && supports_stats && state().lock().unwrap_or_else(|error| error.into_inner()).page == Page::Stats {
+            if first_hello && supports_stats && state().lock().unwrap_or_else(|error| error.into_inner()).page == Page::Stats {
                 arm_timer(FOLLOWUP_DELAY_MS, json!({ "type": "amakano.timer", "kind": "stats-list" }).to_string());
             }
             return false;
@@ -3355,7 +3468,33 @@ astrobox_ng_wit::export!(ImportPlugin with_types_in astrobox_ng_wit);
 // `tools/gen-band-fixture.mjs` 生成、手环侧测试也在读同一份）。
 #[cfg(test)]
 mod tests {
-    use crate::{MAX_SAVE_SLOTS, SAVE_PROTOCOL, saves};
+    use crate::{
+        MAX_SAVE_SLOTS, SAVE_PROTOCOL, mark_first_hello_for_session, saves, saves_capability_missing,
+    };
+
+    /// 「版本或协议不匹配」的判据必须有两半：应用已经活着 + 协议没协商出来。
+    /// 少了「已经活着」这半边，连接时应用还没起来的那几秒会被误报成版本不一致。
+    #[test]
+    fn 应用未醒时的存档超时不算版本或协议不匹配() {
+        assert!(!saves_capability_missing(false, None), "应用一条消息都没答：只能是「手环没有响应」");
+        assert!(saves_capability_missing(true, None), "应用活着但协商不出协议：这才是版本/协议问题");
+        assert!(!saves_capability_missing(true, Some(SAVE_PROTOCOL)), "协商成功就不该再判成版本问题");
+        assert!(!saves_capability_missing(false, Some(SAVE_PROTOCOL)), "上一会话残留的能力值不能顶替「应用活着」");
+    }
+
+    #[test]
+    fn hello_refresh_is_once_per_session_not_once_per_capability() {
+        // session 10 已经完成过能力协商；即使能力仍然有效，session 11 的首条 hello 也必须刷新。
+        let mut handled_session = Some(10);
+        let capability = Some(SAVE_PROTOCOL);
+        assert!(mark_first_hello_for_session(11, &mut handled_session));
+        assert_eq!(capability, Some(SAVE_PROTOCOL));
+        assert!(!mark_first_hello_for_session(11, &mut handled_session));
+
+        // 下一次重连再次获得一次刷新机会，同一会话的心跳仍不会重复刷新。
+        assert!(mark_first_hello_for_session(12, &mut handled_session));
+        assert!(!mark_first_hello_for_session(12, &mut handled_session));
+    }
 
     /// 真机回包（小米手环 10，3 条手动槽 + 1 条自动存档）拍成的界面行。
     ///

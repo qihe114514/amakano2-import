@@ -225,7 +225,7 @@ pub fn refresh_steps(plan: RefreshPlan) -> Vec<RefreshStep> {
 
 /// 把元素 id 解析成动作。**解析不出来就是非法动作**，调用方不用再写前缀判断。
 pub fn parse(id: &str) -> Option<Action> {
-    // 悬停要排在最前面：`hover:nav:library` 也以别的规则沾边，但它属于悬停通道。
+    // 悬停要排在最前面：`hover:nav:push` 也以别的规则沾边，但它属于悬停通道。
     if let Some(rest) = id.strip_prefix(HOVER_PREFIX) {
         return Some(Action::Hover(rest.to_string()));
     }
@@ -433,11 +433,11 @@ mod tests {
 
     #[test]
     fn nav_ids_do_not_collide_with_hover_ids() {
-        // `nav:library` 的悬停 id 是 `hover:nav:library`，两者解析结果必须不同。
-        let hover = parse(&hover_id(&Page::Library.action())).unwrap();
-        assert_eq!(hover, Action::Hover("nav:library".into()));
+        // `nav:push` 的悬停 id 是 `hover:nav:push`，两者解析结果必须不同。
+        let hover = parse(&hover_id(&Page::Push.action())).unwrap();
+        assert_eq!(hover, Action::Hover("nav:push".into()));
         assert!(hover.is_ui_only());
-        assert_eq!(parse("nav:library"), Some(Action::Nav(Page::Library)));
+        assert_eq!(parse("nav:push"), Some(Action::Nav(Page::Push)));
     }
 
     #[test]

@@ -8,21 +8,22 @@ use super::errors::ErrorView;
 
 use serde_json::Value;
 
-/// 导航页。
+/// 导航页。**只有四页，按用户的任务分**，不再按数据类型平铺。
 ///
-/// **只有七页**：原来那一页「传输」已经撤掉 —— 它跟「概览」页的传输卡片、
-/// 「设备」页的刷新手环清单、「设置」页的分片选择器各重叠一块，用户要从概览
-/// 再跳一次「查看传输详情」才看得到同样的数据。撤掉之后传输的实时数据留在概览，
-/// 分片参数留在设置，手环清单留在设备，一处一件事。
+/// 上一版是七页（概览 / 章节 / 存档 / 统计 / 设备 / 设置 / 日志），结果是同一个连接状态
+/// 在顶栏、底栏、概览主卡、设备页各播报一次；进度只在概览，而已安装清单在设备页又与章节页
+/// 重复。收敛之后：
+/// - **推送**：连接进度 + 章节库 + 手环已安装章节（三处合并）；
+/// - **存档** / **统计**：各自一件事；
+/// - **设置**：传输参数 + 行为 + 缓存 + 设备详情 + 运行日志 + 关于。
+///
+/// 连接与传输状态由外壳的常驻任务条（`glass::mission_bar`）统一出口，页面不再重复播报。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
-    Overview,
-    Library,
+    Push,
     Saves,
     Stats,
-    Device,
     Settings,
-    Logs,
 }
 
 pub const NAV_PREFIX: &str = "nav:";
@@ -64,39 +65,24 @@ pub fn chunk_label(bytes: usize) -> String {
 }
 
 impl Page {
-    pub const ALL: [Page; 7] = [
-        Page::Overview,
-        Page::Library,
-        Page::Saves,
-        Page::Stats,
-        Page::Device,
-        Page::Settings,
-        Page::Logs,
-    ];
+    pub const ALL: [Page; 4] = [Page::Push, Page::Saves, Page::Stats, Page::Settings];
 
     pub const fn wire(self) -> &'static str {
         match self {
-            Page::Overview => "overview",
-            Page::Library => "library",
+            Page::Push => "push",
             Page::Saves => "saves",
             Page::Stats => "stats",
-            Page::Device => "device",
             Page::Settings => "settings",
-            Page::Logs => "logs",
         }
     }
 
-    /// 导航标签。**一律两个字**：标签一长，导航条在 400px 窗口里就装不下，
-    /// 每一项会被压成「一个字一行」（见 `glass::nav_bar`）。
+    /// 导航标签。**一律两个字**：标签一长，导航条在 400px 窗口里就装不下（见 `glass::nav_bar`）。
     pub const fn label(self) -> &'static str {
         match self {
-            Page::Overview => "概览",
-            Page::Library => "章节",
+            Page::Push => "推送",
             Page::Saves => "存档",
             Page::Stats => "统计",
-            Page::Device => "设备",
             Page::Settings => "设置",
-            Page::Logs => "日志",
         }
     }
 
@@ -836,7 +822,7 @@ impl Default for Snapshot {
             stage: SessionStage::Idle,
             error: None,
             installed_broken: Vec::new(),
-            page: Page::Overview,
+            page: Page::Push,
             version: String::new(),
             device: DeviceView::default(),
             library: Vec::new(),

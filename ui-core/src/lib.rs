@@ -129,7 +129,7 @@ pub fn demo() -> Snapshot {
         stage: SessionStage::CatalogReady,
         error: None,
         installed_broken: Vec::new(),
-        page: Page::Overview,
+        page: Page::Push,
         version: demo_version(),
         device: DeviceView {
             name: "小米手环 10".into(),
@@ -427,10 +427,10 @@ mod tests {
     #[test]
     fn preview_export_has_one_entry_per_page() {
         let document: Value = serde_json::from_str(&preview_all(&demo())).expect("预览 JSON 必须合法");
-        // 七个页面各一条，**外加**末尾那条「存档（通道不可用）」——那张卡只在通道被
+        // 四个页面各一条，**外加**末尾那条「存档（通道不可用）」——那张卡只在通道被
         // 版本卡住时才出现，必须在预览里看得见（用户实机报的就是它）。
         assert_eq!(document["pages"].as_array().map(Vec::len), Some(Page::ALL.len() + 1));
-        assert_eq!(document["pages"][0]["name"], "概览");
+        assert_eq!(document["pages"][0]["name"], "推送");
         assert_eq!(document["pages"][0]["tree"]["tag"], "div");
         let last = &document["pages"][Page::ALL.len()];
         assert_eq!(last["name"], BLOCKED_VIEW_NAME);
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn single_page_export_names_the_page() {
         let document: Value = serde_json::from_str(&to_json(&demo())).expect("预览 JSON 必须合法");
-        assert_eq!(document["pages"][0]["name"], "概览");
+        assert_eq!(document["pages"][0]["name"], "推送");
     }
 
     /// 界面上不允许出现空文本节点（占位符漏填会在这里炸）。
