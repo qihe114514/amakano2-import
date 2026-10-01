@@ -203,7 +203,7 @@ fn broken_notice(snapshot: &Snapshot) -> Node {
         )
         .child(label(names, SIZE_SMALL, TEXT_SUB))
         .child(label(
-            "这些章节在手环上登记着、但包内容读不出来。重新同步一次这一章即可恢复。",
+            "这些章节在手环上还有登记，但包内容读不出来。重新同步一次这一章就能恢复。",
             SIZE_SMALL,
             TEXT_DIM,
         ))
@@ -233,10 +233,10 @@ fn installed_section(snapshot: &Snapshot) -> Node {
     let stale = snapshot.stale_installed().len();
     let note = if stale > 0 {
         format!(
-            "标「旧版本」的 {stale} 条不在当前插件的章节表里，删掉重新同步一次就不会和新章节混在一起。删的只是手环上那份，插件里还有副本。"
+            "标「旧版本」的 {stale} 条不在当前插件的章节表里。删掉再重新同步，就不会和新章节混在一起；删的只是手环上那份，插件里还有副本。"
         )
     } else {
-        "删掉的只是手环上那份，插件里的副本还在，随时能重新同步".to_string()
+        "删掉的只是手环上那份，插件里的副本还在，随时可以重新同步。".to_string()
     };
     card.child(container).child(meta(note))
 }

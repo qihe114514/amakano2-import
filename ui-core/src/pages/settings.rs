@@ -78,7 +78,7 @@ fn behavior(snapshot: &Snapshot) -> Node {
 fn cache(snapshot: &Snapshot) -> Node {
     let hint = format!("{} · {} 个文件", human_bytes(snapshot.cache_bytes), snapshot.cache_files);
     section("未完成缓存", Some(hint))
-        .child(note("断点续传靠它。清掉之后，没传完的章节要从头再传。"))
+        .child(note("断点续传要用到它；清掉之后，没传完的章节只能从头再传。"))
         .child(ghost_button("清理未完成缓存", actions::CLEAR_CACHE, snapshot.cache_files > 0, snapshot))
 }
 
@@ -106,7 +106,7 @@ fn device(snapshot: &Snapshot) -> Node {
 
     section("设备与连接", None)
         .child(grid)
-        .child(note("连接 / 重新连接 / 打开游戏都在底部的任务条上。"))
+        .child(note("连接 / 重新连接 / 打开游戏都在顶部的任务条上。"))
 }
 
 /// 运行日志（原「日志」页）。
@@ -191,7 +191,7 @@ fn about(snapshot: &Snapshot) -> Node {
 
     section("关于", None)
         .child(grid)
-        .child(note("章节包随插件一起装好，不看本机里的游戏文件。"))
+        .child(note("章节包已经随插件装好，不需要本机里的游戏文件。"))
 }
 
 #[cfg(test)]

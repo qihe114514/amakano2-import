@@ -43,13 +43,18 @@ def packaged_files() -> list[tuple[Path, str]]:
 
 def main() -> int:
     release = '--release' in sys.argv
-    subprocess.run([cargo(), 'build', '--release'] if release else [cargo(), 'build'], cwd=ROOT, check=True)
+    skip_build = '--skip-build' in sys.argv
+    if not skip_build:
+        subprocess.run([cargo(), 'build', '--release'] if release else [cargo(), 'build'], cwd=ROOT, check=True)
     profile = 'release' if release else 'debug'
     source = ROOT / 'target' / 'wasm32-wasip2' / profile / 'amakano2_import.wasm'
     DIST.mkdir(exist_ok=True)
     shutil.copy2(ROOT / 'manifest.json', DIST / 'manifest.json')
     shutil.copy2(ROOT / 'icon.png', DIST / 'icon.png')
-    shutil.copy2(source, DIST / ENTRY)
+    if not skip_build:
+        shutil.copy2(source, DIST / ENTRY)
+    elif not (DIST / ENTRY).is_file():
+        raise SystemExit(f'--skip-build 需要已有 {DIST / ENTRY}')
 
     extra = packaged_files()
     if '--package' in sys.argv:

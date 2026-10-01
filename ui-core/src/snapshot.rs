@@ -154,7 +154,7 @@ impl SessionStage {
         match self {
             SessionStage::Idle => "点上面的「连接设备」开始",
             SessionStage::DeviceFound => "正在注册回包通道…",
-            SessionStage::ChannelRegistered => "正在等手环应用响应（没反应就在手表上打开《甜蜜女友2》）",
+            SessionStage::ChannelRegistered => "正在等手环应用响应（没反应就在手环上打开《甜蜜女友2》）",
             SessionStage::AppAlive => "正在协商版本与能力…",
             SessionStage::Handshaked => "正在读取手环上已安装的章节…",
             SessionStage::CatalogReady => "可以点某一章的「同步」了",
@@ -671,7 +671,7 @@ impl ReadingStatsView {
         self.total_day_count > 0
     }
 
-    /// 概览卡片的副标题。
+    /// 统计页「总阅读时长」那一行的副标题。
     pub fn head_line(&self) -> String {
         if !self.has_data() {
             return "手环上还没有阅读记录".into();
@@ -715,7 +715,7 @@ impl Default for Limits {
 
 impl Limits {
     pub fn window_label(&self) -> String {
-        format!("{} 片", self.initial_window)
+        format!("{} 个分片", self.initial_window)
     }
 
     pub fn probe_label(&self) -> String {
@@ -728,7 +728,7 @@ impl Limits {
 pub struct Snapshot {
     pub page: Page,
     pub version: String,
-    /// 连接走到了哪一步。概览页的分段进度条按它点亮。
+    /// 连接走到了哪一步。推送页的分段进度条按它点亮。
     pub stage: SessionStage,
     /// 最近一次失败（码 + 细节原文）。`None` 表示当前没有失败要讲。
     pub error: Option<ErrorView>,
@@ -974,7 +974,7 @@ impl Snapshot {
         if self.band_version.is_empty() {
             // 手环压根没回 `hello-ok`：旧版白名单 `if` 链没有 `else` 分支，
             // 收到不认识的消息会静默丢弃，所以「没回应」就是这句话的依据。
-            "手环端应用版本过旧，需更新后才能管理存档（手环侧没有回应 amakano.app.hello）".into()
+            "手环端应用版本过旧，需更新后才能管理存档（手环端应用没有回应版本查询）".into()
         } else {
             // 回了，但报回来的协议/能力不够用：版本号并进这一句里，
             // 不再单独渲染一行「报告协议 x、能力 [ ]」——那是同一件事的细节。
@@ -990,7 +990,7 @@ impl Snapshot {
         if self.save_protocol.is_some() {
             return String::new();
         }
-        "到 AIoT-IDE 重新安装带存档功能的新版 RPK 后重试".into()
+        "重新安装带存档功能的新版 RPK 后重试".into()
     }
 
     /// 存档通道被版本卡住：协议没协商出来，而且**已经试过并失败**（不是「还在等」）。
@@ -1036,11 +1036,11 @@ impl Snapshot {
         if self.stats_blocked() {
             let version = self.band_version.clone();
             let conclusion = if version.is_empty() {
-                "手环端应用版本过旧，需更新后才能读取阅读统计（手环端应用不支持 stats 通道）".to_string()
+                "手环端应用版本过旧，需更新后才能读取阅读统计（手环端应用不支持阅读统计）".to_string()
             } else {
-                format!("手环端应用版本过旧，需更新后才能读取阅读统计（手环端应用 v{version} 不支持 stats 通道）")
+                format!("手环端应用版本过旧，需更新后才能读取阅读统计（手环端应用 v{version} 不支持阅读统计）")
             };
-            return Some((conclusion, "到 AIoT-IDE 重新安装新版 RPK 后重试".into()));
+            return Some((conclusion, "重新安装新版 RPK 后重试".into()));
         }
         (!self.stats_error.is_empty()).then(|| (self.stats_error.clone(), String::new()))
     }
@@ -1059,7 +1059,7 @@ impl Snapshot {
         }
     }
 
-    /// 概览页「接下来」那一行：**只挑最要紧的一件事**，一句话说清。
+    /// 推送页「章节库」卡片里「接下来」那一行：**只挑最要紧的一件事**，一句话说清。
     ///
     /// 上一版这里是一张列了 3~5 条的清单（未装章节、传输中提醒、未完成传输、队列），
     /// 每条都带颜色圆点，读起来像日志而不像建议。实际上这四件事里**永远只有第一件**
@@ -1262,8 +1262,8 @@ mod tests {
         assert!(snapshot.saves_blocked());
         let (conclusion, action) = snapshot.saves_blocked_notice().expect("卡住时要有这张卡");
         assert_eq!(conclusion.matches("手环端应用版本过旧").count(), 1, "{conclusion}");
-        assert!(conclusion.contains("amakano.app.hello"), "{conclusion}");
-        assert_eq!(action, "到 AIoT-IDE 重新安装带存档功能的新版 RPK 后重试");
+        assert!(conclusion.contains("没有回应"), "{conclusion}");
+        assert_eq!(action, "重新安装带存档功能的新版 RPK 后重试");
         assert!(!action.contains("版本过旧"), "「怎么办」不许重复结论的判断：{action}");
 
         // ② 手环回了、但能力不够：版本号并进同一句结论里，不再多出第三行。

@@ -1,6 +1,6 @@
 [package]
 name = "amakano2-ui"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
 description = "甜蜜女友2 导入插件的界面树（与宿主无关）"
 

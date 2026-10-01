@@ -115,7 +115,7 @@ pub fn parse_save_text(text: &str, source: &str) -> Result<SaveFile, SaveError> 
     let save_version = object.get("save_version").and_then(Value::as_u64).unwrap_or(0) as u32;
     if save_version > SAVE_VERSION {
         return Err(SaveError::new(format!(
-            "这份存档的信封版本是 {save_version}，这个插件只认到 {SAVE_VERSION}，请更新插件后再导入"
+            "这份存档的信封版本是 {save_version}，当前插件最高支持 {SAVE_VERSION}，请更新插件后再导入"
         )));
     }
     let slots = match object.get("slots") {

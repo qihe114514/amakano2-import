@@ -477,7 +477,7 @@ fn transfer_strip(snapshot: &Snapshot) -> Option<Node> {
             .gap(GAP_XS)
             .child(head)
             .child(progress_bar(resume.percent, 24))
-            .child(meta("断点还在手环上；去「概览」点「接着传」继续。"))
+            .child(meta("断点还在手环上：重连后插件会自动接着传，也可以到「推送」页手动继续。"))
     })
 }
 

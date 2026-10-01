@@ -86,13 +86,13 @@ fn auto_card(snapshot: &Snapshot, rows: &[SaveSlotView]) -> Node {
     }
     if missing > 0 {
         card = card.child(label(
-            format!("有 {missing} 条存档所在的章节还没装到手环上：先在「章节」页同步那一章，再回来读档。"),
+            format!("有 {missing} 条存档所在的章节还没装到手环上：先在「推送」页同步那一章，再回来读档。"),
             SIZE_TINY,
             WARN,
         ));
     }
     card.child(label(
-        "读档就是把手环首页的「继续阅读」指到这一槽。存档记的是「哪一章 + 章内位置」，以后增删章节也不会读错。",
+        "读档就是把首页的「继续阅读」指到这一条。存档记的是「哪一章 + 章内位置」，以后增删章节也不会读错。",
         SIZE_TINY,
         TEXT_DIM,
     ))
@@ -230,12 +230,12 @@ fn footer(snapshot: &Snapshot, rows: &[SaveSlotView]) -> Node {
             TEXT_DIM,
         ))
         .child(label(
-            "导入：把那段 JSON 整段复制回来（别漏开头结尾），再点这个按钮，会按「写档时间」并入手环（同一份覆盖、新的追加到末尾）。",
+            "导入：把那段 JSON 原样复制回来（别漏开头结尾），再点这个按钮。插件会按「写档时间」并入手环：同一份覆盖，新的追加到末尾。",
             SIZE_TINY,
             TEXT_DIM,
         ))
         .child(label(
-            "走剪贴板是为了把存档交到你手里：插件自己的目录不能放东西，一卸载就跟着没了。",
+            "走剪贴板是为了把存档交到你自己手里：插件目录里的文件一卸载就没了。",
             SIZE_TINY,
             TEXT_DIM,
         ));
@@ -481,7 +481,7 @@ mod tests {
         let conclusion = snapshot.saves_blocked_hint();
         let action = snapshot.saves_blocked_action();
         // 结论解释「为什么不可用」（手环没回能力查询），怎么办只说下一步动作，不重复判断。
-        assert!(conclusion.contains("amakano.app.hello"), "{conclusion}");
+        assert!(conclusion.contains("没有回应"), "{conclusion}");
         assert!(!action.contains("版本过旧"), "「怎么办」不许重复结论里的判断：{action}");
         assert_ne!(conclusion, action);
         // 卡片上就是这两行，不多不少。

@@ -77,14 +77,14 @@ impl ErrorCode {
     pub fn advice(self) -> &'static str {
         match self {
             ErrorCode::Link => "断点已经留在手环上，插件会自动重连并接着传；也可以手动点「连接设备」",
-            ErrorCode::Timeout => "确认手表上《甜蜜女友2》已打开且没被切到后台，然后重试",
+            ErrorCode::Timeout => "确认手环上《甜蜜女友2》已打开且没被切到后台，再重试",
             ErrorCode::Protocol => "更新插件或手环端 RPK 到同一条版本线上再试",
-            ErrorCode::Space => "在手环「设置 → 资源包管理」里删掉不用的章节腾出空间，再重试",
-            ErrorCode::Rejected => "换一块分片档位（设置页）或稍后重试",
+            ErrorCode::Space => "在手环「设置 → 资源包管理」里删掉不用的章节包腾出空间，再重试",
+            ErrorCode::Rejected => "换一档分片大小（设置 → 传输分片），或稍后重试",
             ErrorCode::BadPack => "重新打包这一章，或在插件里重新安装一次",
-            ErrorCode::Window => "把分片档位改回默认的 8 KB 再试",
+            ErrorCode::Window => "把分片大小改回默认的 8 KB 再试",
             ErrorCode::DeviceReboot => "手环刚重启完，重新点一次「同步」就会从断点接着传",
-            ErrorCode::Busy => "等当前这一章传完，或先点「取消」",
+            ErrorCode::Busy => "等当前这次操作结束，再试一次",
             ErrorCode::Unknown => "把手环停在《甜蜜女友2》页面再重试；持续失败请把日志发给作者",
         }
     }

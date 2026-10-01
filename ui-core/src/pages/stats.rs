@@ -55,7 +55,7 @@ fn waiting_card(snapshot: &Snapshot) -> Node {
     } else if snapshot.device.connected {
         "手环已连接，但《甜蜜女友2》还没在前台运行：在手环上打开它，再点「读取统计」。"
     } else {
-        "先在「概览」页点「连接设备」，并把《甜蜜女友2》打开，再回来读取统计。"
+        "先在顶部的任务条点「连接设备」，并在手环上打开《甜蜜女友2》，再回来读取统计。"
     };
     section("手环上的阅读统计", Some("尚未读取".into()))
         .child(empty(hint))

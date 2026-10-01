@@ -1,3 +1,4 @@
 target/
 dist/*.abp
+dist/*.zip
 .yanagent/

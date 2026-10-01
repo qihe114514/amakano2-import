@@ -1388,14 +1388,14 @@ fn handle_ready_timeout(request_id: &str) {
     };
     match resend {
         Some((addr, payload)) => {
-            set_status(StatusKind::Warn, "手表未响应，正在重发导入请求…");
+            set_status(StatusKind::Warn, "手环未响应，正在重发导入请求…");
             render();
             astrobox_ng_wit::spawn(async move {
                 let _ = psys_host::interconnect::send_qaic_message(&addr, PACKAGE_NAME, &payload).await;
             });
             arm_timer(READY_TIMEOUT_MS, json!({ "type": "amakano.timer", "kind": "ready", "requestId": request_id }).to_string());
         }
-        None => fail_transfer(ErrorCode::Timeout, "手表未响应导入请求"),
+        None => fail_transfer(ErrorCode::Timeout, "手环未响应导入请求"),
     }
 }
 
@@ -1545,8 +1545,8 @@ impl LaunchOutcome {
         match self {
             LaunchOutcome::Launched => "已自动打开《甜蜜女友2》，正在等待它回应…".into(),
             LaunchOutcome::NotFound(names) => format!("但手环应用列表里没有本应用（检测到 {names}），请确认 RPK 已安装"),
-            LaunchOutcome::Denied => "尝试打开《甜蜜女友2》被系统拒绝，请手动在手表上打开".into(),
-            LaunchOutcome::ListFailed => "读取手环应用列表失败（需要 thirdpartyapp 权限），请手动在手表上打开《甜蜜女友2》".into(),
+            LaunchOutcome::Denied => "尝试打开《甜蜜女友2》被系统拒绝，请手动在手环上打开".into(),
+            LaunchOutcome::ListFailed => "读取手环应用列表失败（需要 thirdpartyapp 权限），请手动在手环上打开《甜蜜女友2》".into(),
             LaunchOutcome::Skipped => "未自动打开应用，可在「设置」页开启自动打开，或点「打开游戏」".into(),
         }
     }
@@ -1765,7 +1765,7 @@ async fn probe_tick(session: u64) {
                 if send_failures > 0 {
                     format!("消息发不出去（已失败 {send_failures} 次）：请重新连接设备，并确认手环上确实装有《甜蜜女友2》")
                 } else {
-                    format!("等待《甜蜜女友2》回应超时（已试 {MAX_PROBE_ATTEMPTS} 次）。请确认手环上已打开应用且**停在《甜蜜女友2》页面**（切走或熄屏它就收不到消息），再点「连接设备」重试")
+                    format!("等待《甜蜜女友2》回应超时（已试 {MAX_PROBE_ATTEMPTS} 次）。请确认手环上已打开应用，并停在《甜蜜女友2》页面（切走或熄屏它就收不到消息），再点「连接设备」重试")
                 },
             );
             render();
@@ -2015,7 +2015,7 @@ async fn start_transfer() {
     if psys_host::interconnect::send_qaic_message(&addr, PACKAGE_NAME, &payload).await.is_ok() {
         set_stage(SessionStage::Transferring);
         clear_error();
-        set_status(StatusKind::Info, "已发送导入请求，等待手表确认…");
+        set_status(StatusKind::Info, "已发送导入请求，等待手环确认…");
         arm_timer(READY_TIMEOUT_MS, json!({ "type": "amakano.timer", "kind": "ready", "requestId": request_id }).to_string());
         tracing::info!(bytes = payload.len(), "sent pack begin request");
     } else {
@@ -2083,7 +2083,7 @@ fn handle_interconnect(payload: &str) -> bool {
                 state.status = match state.resume.as_ref() {
                     Some(pending) => {
                         let percent = if pending.bytes > 0 { pending.received_bytes * 100 / pending.bytes } else { 0 };
-                        format!("发现未完成传输：{} · 已传 {}%，点「继续同步」接着传", pending.chapter_name, percent)
+                        format!("发现未完成传输：{} · 已传 {}%，到「推送」页接着传", pending.chapter_name, percent)
                     }
                     None => "手环上没有未完成的传输".into(),
                 };
@@ -2564,9 +2564,9 @@ fn handle_interconnect(payload: &str) -> bool {
                         state.resume = None;
                     }
                     state.status = if resumed_now {
-                        format!("手表已就绪，从第 {} 片继续传输", next_index + 1)
+                        format!("手环已就绪，从第 {} 个分片继续传输", next_index + 1)
                     } else {
-                        "手表已就绪，正在传输".into()
+                        "手环已就绪，正在传输".into()
                     };
                     state.status_kind = StatusKind::Info;
                 });

@@ -176,7 +176,7 @@ pub fn demo() -> Snapshot {
         save_protocol: Some(1),
         saves_unsupported: false,
         saves_busy: false,
-        band_version: "0.1.0".into(),
+        band_version: "2.0.0".into(),
         saves_notice: "已连接手环，存档列表已刷新".into(),
         // 导出那一行：条数就是真机回包里的 3 条，**字节数按真机那份信封算**（见
         // `demo_export_bytes()`）——「约 7 KB」这类话在窄窗下要放得下，得拿真数字量。
