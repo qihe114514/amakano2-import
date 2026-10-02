@@ -9,6 +9,7 @@
 
 use super::node::{Node, Tag, badge, label};
 use super::errors::ErrorView;
+use super::human_bytes;
 use super::snapshot::{Page, SessionStage, Snapshot, StatusKind};
 use super::theme::*;
 
@@ -349,11 +350,6 @@ pub fn orb(size: u32) -> Node {
     Node::new(Tag::Div).w(size).h(size).shrink(0.0).radius(size / 3).bg(ACCENT_DEEP)
 }
 
-/// 分段进度条（详见 `node::segmented_bar`）。
-pub fn progress_bar(percent: u32, segments: u32) -> Node {
-    super::node::segmented_bar(percent, segments, TRACK, &[ACCENT_LIGHT.to_string(), ACCENT_DEEP.to_string()])
-}
-
 // ---------------------------------------------------------------- 布局骨架
 
 /// 顶栏：品牌 + 名称 + 连接状态，**一行**。
@@ -424,14 +420,34 @@ pub fn nav_bar(snapshot: &Snapshot) -> Node {
         .child(segmented_sized(&items, true, snapshot, 4, 4).pad(4))
 }
 
-/// 常驻传输条：正在传输 / 断点续传时显示，挂在页面**底部**、出现在每一页。
+/// 传输任务卡：**每页顶部的 hero 卡**，插在设备条之下、导航之上。
 ///
-/// 只要还在传（或有断点/待续），它就一直在 —— 用户点完「同步」往往会切去看存档/统计，
-/// 进度不能再只活在某一个页面里。
-fn transfer_strip(snapshot: &Snapshot) -> Option<Node> {
-    if let Some(transfer) = snapshot.transfer.as_ref().filter(|transfer| transfer.started) {
+/// v2 重构把它从「外壳末尾的传输条」搬到了最顶上 —— 用户原话：
+/// 「把传输进度放在页面最下方干什么？都看不到，这明明是最重要的内容」。
+/// 传输是这只插件的头等大事，这张卡因此有三条规矩：
+///
+/// 1. **每页常驻**：切到存档/统计也看得见（`every_page_keeps_the_transfer_task`）；
+/// 2. **hero 化**：34px 大号百分比 + 12px 粗进度条，进页面第一个看到的就是它；
+/// 3. **断点必须可操作**：「继续传输」按钮就挂在这张卡上（`actions::RESUME`），
+///    不再只给一句「到推送页手动继续」的指路文案。
+///
+/// 优先级：传输中 > 断点待续 > 正在查询断点。断点查询那条管的是重连后的盲区：
+/// 手环应用已经应答、但断点回包还没回来，界面不再是空白而是「正在查询」。
+fn transfer_task(snapshot: &Snapshot) -> Option<Node> {
+    // 传输中：hero 卡。
+    //
+    // ⚠️ 「等手环确认」那一态**过期之后不算在传**：留着它会把下面那张带「继续传输」的
+    // 断点卡顶掉，用户看到的是一张 0% + 速度「—」+ 剩余「—」、而且永远不动的卡
+    // （2026-10-02 真机原话：点了继续传输不传输，速度和剩余都不显示）。过期就让它落到
+    // 断点卡/章节行上去，那里有可点的出口。
+    if let Some(transfer) = snapshot
+        .transfer
+        .as_ref()
+        .filter(|transfer| transfer.started && !transfer.stalled)
+    {
+        // `ready` = 手环已经回过 `files.ready`（握手完成、正在收分片）；没 ready 才是在等确认。
         let marker = state_badge(
-            if transfer.ready {
+            if !transfer.ready {
                 "等待手环确认"
             } else if transfer.resumed {
                 "断点续传"
@@ -440,45 +456,109 @@ fn transfer_strip(snapshot: &Snapshot) -> Option<Node> {
             },
             if transfer.shaky() { StatusKind::Warn } else { StatusKind::Good },
         );
-        let head = Node::new(Tag::Div)
-            .full()
-            .row()
-            .align("center")
-            .gap(GAP_SM)
-            .child(label(&transfer.chapter, SIZE_SMALL, TEXT_MAIN).weight(600).grow(1.0))
-            .child(label(format!("{}%", transfer.percent), SIZE_SMALL, ACCENT).weight(700).shrink(0.0))
-            .child(marker);
         let queue = snapshot.queue.len();
-        let meta_line = if queue > 0 {
+        let queue_note = if queue > 0 { format!(" · 队列 {} 章", queue) } else { String::new() };
+        // 还没等到手环确认时**别摆「— · 剩余 —」**：速度与剩余都还没开始量，
+        // 两个字都显示成「—」看起来像坏了（用户原话就是这么描述的）。这里直接说在等什么。
+        let meta_line = if !transfer.ready {
+            format!("已发导入请求，正在等手环确认…{queue_note}")
+        } else if queue > 0 {
             format!("{} · 剩余 {} · 队列 {} 章", transfer.speed_label(), transfer.eta_label(), queue)
         } else {
             format!("{} · 剩余 {}", transfer.speed_label(), transfer.eta_label())
         };
         return Some(
-            panel(CARD_RADIUS)
-                .pad(10)
-                .gap(GAP_XS)
-                .child(head)
-                .child(progress_bar(transfer.percent, 24))
-                .child(meta(meta_line)),
+            transfer_card(TRANSFER_BG, TRANSFER_STROKE)
+                .child(
+                    Node::new(Tag::Div)
+                        .full()
+                        .row()
+                        .align("center")
+                        .gap(GAP_SM)
+                        .child(
+                            label(format!("{}%", transfer.percent), SIZE_HERO, ACCENT)
+                                .weight(700)
+                                .shrink(0.0),
+                        )
+                        .child(Node::new(Tag::Div).grow(1.0))
+                        .child(marker),
+                )
+                .child(label(&transfer.chapter, SIZE_BODY, TEXT_MAIN).weight(600))
+                .child(transfer_bar(transfer.percent))
+                .child(meta(&meta_line)),
         );
     }
-    snapshot.resume.as_ref().map(|resume| {
-        let head = Node::new(Tag::Div)
-            .full()
-            .row()
-            .align("center")
-            .gap(GAP_SM)
-            .child(label(&resume.chapter, SIZE_SMALL, TEXT_MAIN).weight(600).grow(1.0))
-            .child(label(format!("{}%", resume.percent), SIZE_SMALL, WARN).weight(700).shrink(0.0))
-            .child(state_badge("上次没传完", StatusKind::Warn));
-        panel(CARD_RADIUS)
-            .pad(10)
-            .gap(GAP_XS)
-            .child(head)
-            .child(progress_bar(resume.percent, 24))
-            .child(meta("断点还在手环上：重连后插件会自动接着传，也可以到「推送」页手动继续。"))
+    // 断点待续：上次没传完。「继续传输」是这一版最重要的新出口 ——
+    // 断点卡片从「纯文案」变成「一个动作」，重连后不用再去推送页找那一章。
+    if let Some(resume) = snapshot.resume.as_ref() {
+        return Some(
+            transfer_card(TRANSFER_HELD_BG, TRANSFER_HELD_STROKE)
+                .child(
+                    Node::new(Tag::Div)
+                        .full()
+                        .row()
+                        .align("center")
+                        .gap(GAP_SM)
+                        .child(state_badge("上次没传完", StatusKind::Warn))
+                        .child(Node::new(Tag::Div).grow(1.0))
+                        .child(
+                            label(format!("{}%", resume.percent), SIZE_HERO, WARN)
+                                .weight(700)
+                                .shrink(0.0),
+                        ),
+                )
+                .child(label(&resume.chapter, SIZE_BODY, TEXT_MAIN).weight(600))
+                .child(held_bar(resume.percent))
+                .child(meta(&format!(
+                    "已传 {} / {} · 完成 {} 个文件 · 断点在手环上，点一下接着传",
+                    human_bytes(resume.received),
+                    human_bytes(resume.total),
+                    resume.files_done
+                )))
+                // 1.x 旧代：断点续传也一并禁用（那条断点属于旧包格式，续了也读不了），
+                // 原因由推送页的 legacy_notice 卡说，这里只负责按钮不可点。
+                .child(primary_button(
+                    "继续传输",
+                    super::actions::RESUME,
+                    !snapshot.band_game_legacy,
+                    snapshot,
+                )),
+        );
+    }
+    // 断点查询中：盲区里给一句话，别让用户对着空白猜「到底续不续」。
+    snapshot.resume_checking.then(|| {
+        nested(ROW_RADIUS).pad(10).child(label("正在查询手环上的断点…", SIZE_SMALL, TEXT_SUB))
     })
+}
+
+/// 传输任务卡的底：自带粉调底色与亮粉描边的卡片（`panel` 的传输特化版）。
+///
+/// 刻意**不挂** `transition`：传输卡每次 chunk-ok 都整树重绘，过渡追不上。
+fn transfer_card(bg: &str, stroke: &str) -> Node {
+    Node::new(Tag::Div)
+        .full()
+        .column()
+        .gap(GAP_SM)
+        .pad(CARD_PAD)
+        .radius(CARD_RADIUS)
+        .bg(bg)
+        .border(1, stroke)
+}
+
+/// hero 进度条：比列表里的（8px）粗一档，亮端到主色的逐段插值不变。
+fn transfer_bar(percent: u32) -> Node {
+    super::node::segmented_bar_sized(
+        percent,
+        28,
+        12,
+        TRACK,
+        &[ACCENT_LIGHT.to_string(), ACCENT.to_string()],
+    )
+}
+
+/// 断点条的亮端用 WARN 黄：这条进度不是「正在发生」，是「待续」。
+fn held_bar(percent: u32) -> Node {
+    super::node::segmented_bar_sized(percent, 28, 12, TRACK, &[WARN.to_string(), WARN.to_string()])
 }
 
 /// 顶部常驻设备条：**连接状态与主操作的唯一出口**，固定在任何页面最上方
@@ -513,7 +593,7 @@ pub fn device_bar(snapshot: &Snapshot) -> Node {
     )
 }
 
-/// 页面外壳：顶栏 + **设备条（常驻在最上方）** + 导航 + 内容（+ 有传输时的底部传输条）。
+/// 页面外壳：顶栏 + 设备条 + **传输任务卡（有传输/断点时）** + 导航 + 内容。
 ///
 /// 三件事都是**用户实机反馈后定下来的**，改之前先读这里：
 ///
@@ -525,6 +605,10 @@ pub fn device_bar(snapshot: &Snapshot) -> Node {
 /// 3. **内容直接当子节点**：0.5.0 用「舞台层 + 两帧渲染 + transition」做切页滑动，
 ///    真机很卡（宿主每次渲染重建子树，两帧之间插不进过渡），已整块撤掉 ——
 ///    所以外壳里**不许再出现** `transform` / `opacity` / `transition`，单测盯着这一条。
+///
+/// v2 新增第四条：**传输任务卡插在设备条与导航之间**（顶栏 → 设备条 → 传输卡 → 导航
+/// → 内容）。旧版把它追加在外壳**末尾**，推送页两个内部滚动区把它挤出首屏 ——
+/// 用户原话「把传输进度放在页面最下方干什么？都看不到，这明明是最重要的内容」。
 pub fn shell(snapshot: &Snapshot, content: Node) -> Node {
     let mut root = Node::new(Tag::Div)
         .full()
@@ -532,13 +616,11 @@ pub fn shell(snapshot: &Snapshot, content: Node) -> Node {
         .gap(GAP_LG)
         .pad_y(PAGE_PAD_Y)
         .child(top_bar(snapshot))
-        .child(device_bar(snapshot))
-        .child(nav_bar(snapshot))
-        .child(content);
-    if let Some(strip) = transfer_strip(snapshot) {
-        root = root.child(strip);
+        .child(device_bar(snapshot));
+    if let Some(task) = transfer_task(snapshot) {
+        root = root.child(task);
     }
-    root
+    root.child(nav_bar(snapshot)).child(content)
 }
 
 #[cfg(test)]
@@ -619,22 +701,34 @@ mod tests {
         assert!(texts.contains(&"连接设备"), "没连手环时主操作是连接设备：{texts:?}");
     }
 
-    /// 传输中：底部常驻传输条（章节 + 百分比 + 队列）与顶部设备条同时存在。
+    /// 传输中：顶部传输任务卡（章节 + 大号百分比 + 队列）与设备条同时存在，
+    /// 而且**任务卡在导航之上** —— 这是 v2 重构的核心诉求：
+    /// 「传输进度放在页面最下方干什么？都看不到」。
     #[test]
-    fn transfer_strip_stays_persistent_with_device_bar_on_top() {
+    fn transfer_task_sits_above_the_nav_and_persists_with_device_bar() {
         let snapshot = crate::demo();
         let root = shell(&snapshot, Node::new(Tag::Div));
         let texts = root.texts();
-        assert!(texts.iter().any(|text| *text == "33%"), "传输条要常驻显示百分比：{texts:?}");
+        assert!(texts.iter().any(|text| *text == "33%"), "传输卡要显示百分比：{texts:?}");
         assert!(texts.iter().any(|text| text.contains("队列")), "要带上队列：{texts:?}");
-        assert!(texts.contains(&"打开游戏"), "设备条与传输条要同时存在：{texts:?}");
+        assert!(texts.contains(&"打开游戏"), "设备条与传输卡要同时存在：{texts:?}");
+
+        let nav_index =
+            root.children.iter().position(|child| child.tag == Tag::Scroll).expect("导航条是外壳直接子节点");
+        let task_index = root
+            .children
+            .iter()
+            .position(|child| child.get("bg") == Some(TRANSFER_BG))
+            .expect("传输中的外壳里要有传输任务卡");
+        assert!(task_index < nav_index, "传输任务卡必须排在导航之前（页面顶部），不能沉底");
     }
 
-    /// 「传输显示常驻」的可测定义：传输中，**每一页**的外壳都渲染同一条传输条。
+    /// 「传输显示常驻」的可测定义：传输中，**每一页**的外壳都渲染同一张传输任务卡，
+    /// 且每页都排在导航之上。
     ///
     /// 这条守的是用户的原始要求「传输时那个传输显示要常驻」：进度不能只在某一页出现。
     #[test]
-    fn every_page_keeps_the_transfer_strip() {
+    fn every_page_keeps_the_transfer_task_above_the_nav() {
         let mut snapshot = crate::demo();
         for page in Page::ALL {
             snapshot.page = page;
@@ -642,9 +736,85 @@ mod tests {
             let texts = tree.texts();
             assert!(
                 texts.iter().any(|text| *text == "33%"),
-                "{page:?} 页丢了常驻传输条：{texts:?}"
+                "{page:?} 页丢了常驻传输卡：{texts:?}"
             );
+            let nav_index =
+                tree.children.iter().position(|child| child.tag == Tag::Scroll).expect("导航条是外壳直接子节点");
+            let task_index = tree
+                .children
+                .iter()
+                .position(|child| child.get("bg") == Some(TRANSFER_BG))
+                .unwrap_or_else(|| panic!("{page:?} 页找不到传输任务卡"));
+            assert!(task_index < nav_index, "{page:?} 页的传输卡要在导航之上");
         }
+    }
+
+    /// 断点待续态：卡片上必须有可点的「继续传输」按钮，动作 id 是 `resume`。
+    ///
+    /// 这条守的是用户的第二个原话诉求：「我重新连接手表后没有继续按钮啊！」——
+    /// 旧版断点卡片只有一句「到推送页手动继续」的指路文案，没有任何动作。
+    #[test]
+    fn resume_card_carries_a_working_continue_button() {
+        let mut snapshot = Snapshot::default();
+        snapshot.resume = Some(crate::snapshot::ResumeView {
+            pack_id: "p4".into(),
+            chapter: "结灯线1·序章".into(),
+            percent: 62,
+            received: 620,
+            total: 1_000,
+            files_done: 17,
+            resume_from: 28,
+        });
+        let root = shell(&snapshot, Node::new(Tag::Div));
+        let texts = root.texts();
+        assert!(texts.contains(&"继续传输"), "断点卡上要有「继续传输」按钮：{texts:?}");
+        assert!(texts.contains(&"62%"), "断点卡要显示已传百分比：{texts:?}");
+        let buttons = root.find(|node| node.get("on.click") == Some(super::super::actions::RESUME));
+        assert_eq!(buttons.len(), 1, "「继续传输」按钮恰好一个：{buttons:?}");
+        // 断点态用暖黄警示底，与传输中的粉卡区分开。
+        assert!(
+            root.find(|node| node.get("bg") == Some(TRANSFER_HELD_BG)).len() == 1,
+            "断点卡要用警示配色"
+        );
+    }
+
+    /// 重连后的断点查询盲区：应用已就绪、断点回包未到时，要有一句「正在查询」，
+    /// 不能什么都不显示。
+    #[test]
+    fn resume_checking_shows_its_own_hint_instead_of_nothing() {
+        let mut snapshot = Snapshot::default();
+        snapshot.resume_checking = true;
+        let root = shell(&snapshot, Node::new(Tag::Div));
+        let texts = root.texts();
+        assert!(
+            texts.iter().any(|text| text.contains("正在查询手环上的断点")),
+            "查询盲区里要有提示：{texts:?}"
+        );
+
+        // 回包到了（resume 有值）就换正式的断点卡，查询提示退场。
+        snapshot.resume = Some(crate::snapshot::ResumeView {
+            pack_id: "p4".into(),
+            chapter: "结灯线1·序章".into(),
+            percent: 62,
+            received: 620,
+            total: 1_000,
+            files_done: 17,
+            resume_from: 28,
+        });
+        snapshot.resume_checking = true;
+        let root = shell(&snapshot, Node::new(Tag::Div));
+        let texts = root.texts();
+        assert!(!texts.iter().any(|text| text.contains("正在查询")), "断点卡出现后查询提示要退场");
+        assert!(texts.contains(&"继续传输"));
+    }
+
+    /// 没有传输、没有断点、不在查询：外壳里不出现传输卡。
+    #[test]
+    fn idle_shell_has_no_transfer_card() {
+        let root = shell(&Snapshot::default(), Node::new(Tag::Div));
+        assert!(root.find(|node| node.get("bg") == Some(TRANSFER_BG)).is_empty());
+        assert!(root.find(|node| node.get("bg") == Some(TRANSFER_HELD_BG)).is_empty());
+        assert_eq!(root.children.len(), 4, "顶栏 + 设备条 + 导航 + 内容");
     }
 
     #[test]
@@ -767,12 +937,14 @@ mod tests {
 
     #[test]
     fn progress_bar_marks_by_percent_and_keeps_segment_count() {
-        let bar = progress_bar(50, 10);
-        assert_eq!(bar.children.len(), 10);
+        let bar = transfer_bar(50);
+        assert_eq!(bar.children.len(), 28);
         let filled = bar.children.iter().filter(|child| child.get("bg") != Some(TRACK)).count();
-        assert_eq!(filled, 5);
+        assert_eq!(filled, 14);
         // 每段都靠 flex-grow 撑满，不依赖百分比宽度。
         assert!(bar.children.iter().all(|child| child.get("grow") == Some("1")));
+        // hero 条是 12px 粗。
+        assert!(bar.children.iter().all(|child| child.get("h") == Some("12")));
     }
 
     #[test]

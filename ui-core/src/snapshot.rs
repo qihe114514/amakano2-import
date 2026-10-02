@@ -316,23 +316,26 @@ pub struct PackView {
 
 impl PackView {
     /// 阅读时长的人话写法。
+    ///
+    /// **必须带「阅读」字样**：不带的话，用户把「约 54 分钟」理解成「推送要花 54 分钟」
+    /// （真有人这么理解过），这个数字是这一章全文的阅读时长，与传输耗时无关。
     pub fn minutes_label(&self) -> String {
         if self.minutes >= 60 {
             let hours = self.minutes / 60;
             let rest = self.minutes % 60;
             if rest == 0 {
-                format!("约 {hours} 小时")
+                format!("阅读约 {hours} 小时")
             } else {
-                format!("约 {hours} 小时 {rest} 分")
+                format!("阅读约 {hours} 小时 {rest} 分")
             }
         } else {
-            format!("约 {} 分钟", self.minutes)
+            format!("阅读约 {} 分钟", self.minutes)
         }
     }
 
     /// 章节行下面那一行元信息。
     ///
-    /// **一行说完**：上一版分两行（「约 54 分钟 · 736 KB · 41 幕」+「共通线 · 1066 句对白」），
+    /// **一行说完**：上一版分两行（「阅读约 54 分钟 · 736 KB · 41 幕」+「共通线 · 1066 句对白」），
     /// 15 行列表就是 30 行小字。线路名不进这一行 —— 行首的序号砖已经用颜色在标线路了。
     pub fn meta_line(&self) -> String {
         format!(
@@ -372,8 +375,16 @@ pub struct TransferView {
     pub rtt_ms: u64,
     pub retries: u8,
     pub resumed: bool,
+    /// 手环已确认（握手完成，正在收分片）。`false` = 还在「已发请求、等手环确认」。
     pub ready: bool,
     pub started: bool,
+    /// 这次传输已经不再活跃（插件侧 `transfer_live` 为假）：等确认过期了，或者握手完成后
+    /// 长时间没有任何进展。
+    ///
+    /// 这一态必须能被界面看见：它就是真机上「点继续传输不传输、速度与剩余全是「—」」的那个
+    /// 状态 —— 旧的 `is_transferring()`（`started && !ready`）会把所有同步按钮永久禁掉。
+    /// 判定为不活跃之后按钮要放回来、卡片要让位给可点的出口（断点卡/章节行）。
+    pub stalled: bool,
     pub chunk_bytes: usize,
 }
 
@@ -743,6 +754,9 @@ pub struct Snapshot {
     pub installed_broken: Vec<String>,
     pub transfer: Option<TransferView>,
     pub resume: Option<ResumeView>,
+    /// 重连后手环应用已就绪、但断点回包还没到：界面在这段盲区里显示
+    /// 「正在查询手环上的断点…」，而不是什么都不说。
+    pub resume_checking: bool,
     pub cache_bytes: usize,
     pub cache_files: usize,
     pub chunk_bytes: usize,
@@ -787,6 +801,12 @@ pub struct Snapshot {
     pub saves_busy: bool,
     /// 手环快应用版本（来自 hello-ok），用于「版本过旧」的提示。
     pub band_version: String,
+    /// 手环上的游戏是 **1.x 旧代**（主版本号 < 2，或活着却协商不出协议 —— 连 hello 都没有）。
+    ///
+    /// 判定在插件侧落定（hello-ok 解析 / 存档请求超时归因），这里只负责把结论与
+    /// 「怎么办」用 [`Snapshot::band_game_legacy_hint`] / [`Snapshot::band_game_legacy_action`]
+    /// 说出来；推送页挂卡、禁用同步，存档页挂卡、禁用导入。
+    pub band_game_legacy: bool,
     /// 存档页顶部的操作结果（导出/导入/读档/删除各一句）。
     pub saves_notice: String,
     /// 上一次「导出到剪贴板」的结果；`None` 表示这一轮还没导出过。
@@ -830,6 +850,7 @@ impl Default for Snapshot {
             installed: Vec::new(),
             transfer: None,
             resume: None,
+            resume_checking: false,
             cache_bytes: 0,
             cache_files: 0,
             chunk_bytes: 8192,
@@ -848,6 +869,7 @@ impl Default for Snapshot {
             saves_unsupported: false,
             saves_busy: false,
             band_version: String::new(),
+            band_game_legacy: false,
             saves_notice: String::new(),
             save_export: None,
             save_import: None,
@@ -909,8 +931,26 @@ impl Snapshot {
         self.installed.iter().filter(|record| record.stale).collect()
     }
 
+    /// 传输**真的在跑**吗（同步/继续按钮据此禁用）。
+    ///
+    /// ⚠️ 卡在「等手环确认」并且已经过期的那一态**不算在传**：应用被挂起时插件挂的
+    /// ready 定时器会丢，这一态就再也没人回收。旧写法（`started && !ready`）把它算成
+    /// 「正在传」，于是所有同步/继续按钮永久禁用 —— 重连之后用户点「继续传输」什么都不发生
+    /// （2026-10-02 真机）。过期之后按钮必须放回来，重来由插件侧 `start_transfer`
+    /// 的过期判定接管。
     pub fn is_transferring(&self) -> bool {
-        self.transfer.as_ref().is_some_and(|transfer| transfer.started && !transfer.ready)
+        self.transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.started && !transfer.ready && !transfer.stalled)
+    }
+
+    /// 断点指向的那一章在章节库里的编号。
+    ///
+    /// 推送页用它把那一行的按钮从「同步/重传」换成「继续」——断点就在手环上，
+    /// 点这一行就是接着传。章节表对不上（版本变动）时返回 `None`，行按钮保持原样。
+    pub fn resume_pack_number(&self) -> Option<usize> {
+        let resume = self.resume.as_ref()?;
+        self.pack_by_id(&resume.pack_id).map(|pack| pack.number)
     }
 
     /// 这个动作对应的按钮是不是正被按住。
@@ -991,6 +1031,29 @@ impl Snapshot {
             return String::new();
         }
         "重新安装带存档功能的新版 RPK 后重试".into()
+    }
+
+    // ---- 游戏代际（1.x 旧版 → 卸载重装） ----
+
+    /// 手环上的游戏是 1.x 旧代时的**结论**（唯一出处；插件侧只置 [`Snapshot::band_game_legacy`] 位）。
+    ///
+    /// 报得上版本号就把版本号说进去（「v1.6.3」），报不上（连 hello 都没有的更老版本）
+    /// 就说清依据是「没有回应版本查询」。
+    pub fn band_game_legacy_hint(&self) -> String {
+        if self.band_version.is_empty() {
+            "手环上的《甜蜜女友2》是 1.x 旧版（没有回应版本查询）。2.0 起存档结构与章节包格式都已更换，旧版读不了新章节包".into()
+        } else {
+            format!(
+                "手环上的《甜蜜女友2》是 1.x 旧版（v{}）。2.0 起存档结构与章节包格式都已更换，旧版读不了新章节包",
+                self.band_version
+            )
+        }
+    }
+
+    /// 结论之后那句**怎么办**：卸载重装是唯一出路（覆盖安装跨不了大版本），
+    /// 并把「存档会跟着卸载一起没」先说在前面，别让用户存档丢了才发现。
+    pub fn band_game_legacy_action(&self) -> String {
+        "请先在手环上卸载游戏，再重新安装 2.0 版 RPK（卸载会连存档一起清掉，无法保留）".into()
     }
 
     /// 存档通道被版本卡住：协议没协商出来，而且**已经试过并失败**（不是「还在等」）。
@@ -1074,6 +1137,10 @@ impl Snapshot {
         if !self.device.alive {
             return (StatusKind::Warn, "在手环上打开《甜蜜女友2》，这里就会自动接上".into());
         }
+        // 旧代游戏排在「还有几章没同步」前面：它连一章都同步不了，先解决版本问题。
+        if self.band_game_legacy {
+            return (StatusKind::Bad, "手环上是 1.x 旧版游戏：先卸载重装 2.0 版，再同步章节".into());
+        }
         if self.pending_count() > 0 {
             return (StatusKind::Info, format!("还有 {} 章没同步到手环", self.pending_count()));
         }
@@ -1122,8 +1189,34 @@ mod tests {
             resumed: false,
             ready: false,
             started: true,
+            stalled: false,
             chunk_bytes: 8192,
         }
+    }
+
+    #[test]
+    fn a_stalled_handshake_no_longer_blocks_every_button() {
+        // 真机原话（2026-10-02）：**重新连接后点「继续传输」不传输，速度和剩余都显示「—」**。
+        // 病因是「已发请求、等手环确认」这一态没人回收（应用被挂起时插件挂的定时器会丢），
+        // 而 `is_transferring()` 把它算成「在传」→ 推送页每一章的同步/继续按钮全被禁掉。
+        let mut snapshot = Snapshot::default();
+        snapshot.transfer = Some(transfer(0, 1000, 0.0));
+        assert!(snapshot.is_transferring(), "还没到期的等待仍算在传（按钮先别放）");
+
+        let mut stalled = transfer(0, 1000, 0.0);
+        stalled.stalled = true;
+        snapshot.transfer = Some(stalled);
+        assert!(
+            !snapshot.is_transferring(),
+            "等待过期 / 握手后长时间静默之后按钮必须放回来，否则用户点什么都动不了"
+        );
+
+        // 已经握过手（`ready`）的传输本来就不在这个判据里 —— 它挡住重复点击靠的是插件侧的
+        // `transfer_live`（活着就回一句「同步已开始」），这里只负责「等确认」那一段。
+        let mut running = transfer(500, 1000, 12.0);
+        running.ready = true;
+        snapshot.transfer = Some(running);
+        assert!(!snapshot.is_transferring());
     }
 
     #[test]
@@ -1198,12 +1291,14 @@ mod tests {
     #[test]
     fn pack_meta_and_labels_read_naturally() {
         let mut view = pack(1, 1_572_864, 95, false);
-        assert_eq!(view.minutes_label(), "约 1 小时 35 分");
-        assert_eq!(view.meta_line(), "约 1 小时 35 分 · 1.50 MB · 10 幕 · 100 句");
+        // 「阅读」字样必须有：不然「约 54 分钟」会被当成推送耗时（真有人这么误解过）。
+        assert_eq!(view.minutes_label(), "阅读约 1 小时 35 分");
+        assert_eq!(view.meta_line(), "阅读约 1 小时 35 分 · 1.50 MB · 10 幕 · 100 句");
+        assert!(view.minutes_label().starts_with("阅读"));
         view.minutes = 59;
-        assert_eq!(view.minutes_label(), "约 59 分钟");
+        assert_eq!(view.minutes_label(), "阅读约 59 分钟");
         view.minutes = 120;
-        assert_eq!(view.minutes_label(), "约 2 小时");
+        assert_eq!(view.minutes_label(), "阅读约 2 小时");
     }
 
     /// 「接下来」永远只说**最要紧的那一件**，优先级从「插件坏了」一路排到「都装好了」。

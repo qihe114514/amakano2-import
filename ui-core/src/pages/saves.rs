@@ -28,8 +28,12 @@ pub fn render(snapshot: &Snapshot) -> Node {
     // 徽章、计数、列表就不可能各看一眼不同的输入。
     let rows = snapshot.saves();
     let mut page = Node::new(Tag::Div).full().column().gap(GAP_LG);
-    if let Some((conclusion, action)) = snapshot.saves_blocked_notice() {
-        page = page.child(error_card(&conclusion, &action));
+    // 1.x 旧代：这张卡**替代**「存档通道不可用」卡 —— 它的信息更具体（哪一版、怎么办），
+    // 两张同时挂只会让用户读两遍同一个事实。
+    if snapshot.band_game_legacy {
+        page = page.child(error_card("游戏版本过旧", &snapshot.band_game_legacy_hint(), &snapshot.band_game_legacy_action()));
+    } else if let Some((conclusion, action)) = snapshot.saves_blocked_notice() {
+        page = page.child(error_card("存档通道不可用", &conclusion, &action));
     }
     page = page.child(auto_card(snapshot, &rows));
     page = page.child(slot_list(snapshot, &rows));
@@ -45,11 +49,13 @@ pub fn render(snapshot: &Snapshot) -> Node {
 /// - **结论只有一处**（`Snapshot::saves_blocked_hint`，插件侧只置 `saves_unsupported` 状态位）；
 /// - 第二句只讲**下一步怎么办**，不再重复结论里的判断；
 /// - 警示色只有标题这一种（`BAD`），正文两行按本页其它卡片的层级来（正文 `TEXT_SUB` / 说明 `TEXT_DIM`）。
-fn error_card(conclusion: &str, action: &str) -> Node {
+///
+/// 1.x 旧代判定成立时这张卡换个标题（「游戏版本过旧」）挂同一套版式 —— 见 `render`。
+fn error_card(title: &str, conclusion: &str, action: &str) -> Node {
     let mut card = panel(CARD_RADIUS)
         .pad(CARD_PAD)
         .gap(GAP_SM)
-        .child(label("存档通道不可用", SIZE_H2, BAD).weight(600))
+        .child(label(title, SIZE_H2, BAD).weight(600))
         .child(label(conclusion, SIZE_SMALL, TEXT_SUB));
     if !action.is_empty() {
         card = card.child(label(action, SIZE_TINY, TEXT_DIM));
@@ -84,7 +90,9 @@ fn auto_card(snapshot: &Snapshot, rows: &[SaveSlotView]) -> Node {
     if !snapshot.saves_notice.is_empty() {
         card = card.child(label(snapshot.saves_notice.clone(), SIZE_TINY, TEXT_SUB));
     }
-    if missing > 0 {
+    // 「有 N 条存档的章节没装」这句在旧代游戏下**不说**：它教用户「去推送页同步那一章」，
+    // 而旧代下同步入口正被拦着（上面那张卡就是原因），两句话互相打架。
+    if missing > 0 && !snapshot.band_game_legacy {
         card = card.child(label(
             format!("有 {missing} 条存档所在的章节还没装到手环上：先在「推送」页同步那一章，再回来读档。"),
             SIZE_TINY,
@@ -206,21 +214,38 @@ fn slot_row(snapshot: &Snapshot, save: &SaveSlotView, title: &str) -> Node {
 ///
 /// **走剪贴板，不走系统文件对话框**：Dialog 那一类需要用户交互的宿主调用在这个宿主上
 /// 会永远不返回、把事件分发器堵死（真机实测，见 `docs/插件开发注意事项.md` 第 7 节）。
+///
+/// 按钮行包在**横向滚动区**里（与线路筛选同款的两层保险）：三个按钮在 400px 窗口里
+/// 恰好差几个像素放不下，没有滚动区时最右边的「刷新」会被直接裁掉（v2 预览截图实测）。
 fn footer(snapshot: &Snapshot, rows: &[SaveSlotView]) -> Node {
     let ready = snapshot.saves_ready();
     let has_saves = !rows.is_empty();
 
-    let buttons = Node::new(Tag::Div)
+    let buttons = Node::new(Tag::Scroll)
+        .full()
         .row()
-        .gap(GAP_SM)
-        .child(primary_button(
-            "导出到剪贴板",
-            actions::SAVES_EXPORT,
-            ready && has_saves,
-            snapshot,
-        ))
-        .child(ghost_button("从剪贴板导入", actions::SAVES_IMPORT, ready, snapshot))
-        .child(ghost_button("刷新", actions::SAVES_REFRESH, ready, snapshot));
+        .scroll("x")
+        .child(
+            Node::new(Tag::Div)
+                .row()
+                .gap(GAP_SM)
+                .child(primary_button(
+                    "导出到剪贴板",
+                    actions::SAVES_EXPORT,
+                    ready && has_saves,
+                    snapshot,
+                ))
+                // 导入在 1.x 旧代上必须禁用：写进去的是 2.0 的存档结构，
+                // 旧版游戏读不懂，轻则存档列表花脸、重则连累它自己的写档。
+                // 导出保留 —— 卸载前把旧存档捞一份到剪贴板，是用户仅剩的后悔药。
+                .child(ghost_button(
+                    "从剪贴板导入",
+                    actions::SAVES_IMPORT,
+                    ready && !snapshot.band_game_legacy,
+                    snapshot,
+                ))
+                .child(ghost_button("刷新", actions::SAVES_REFRESH, ready, snapshot)),
+        );
 
     let mut card = section("复制 / 粘贴（剪贴板）", None)
         .child(buttons)
@@ -313,6 +338,13 @@ mod tests {
         assert!(texts.contains(&"存档 1") && texts.contains(&"存档 2"), "两条手动槽都要在");
         // 导出/导入改走剪贴板之后，按钮文案要说清「剪贴板」这件事。
         assert!(texts.contains(&"导出到剪贴板") && texts.contains(&"从剪贴板导入") && texts.contains(&"刷新"));
+        // 剪贴板按钮行要包在**横向滚动区**里：三个按钮在 400px 窗口放不下，
+        // 没有滚动区时最右边的「刷新」被直接裁掉（v2 预览截图实测）。
+        let scrolls = tree.find(|node| node.tag == Tag::Scroll && node.get("scroll") == Some("x"));
+        assert!(
+            scrolls.iter().any(|area| area.texts().contains(&"刷新")),
+            "剪贴板按钮行缺少横向滚动兜底"
+        );
         assert!(!texts.iter().any(|text| text.contains("导出存档")), "旧文案「导出存档…」不许回来");
         assert_eq!(tree.find(|node| node.get("on.click") == Some("save-export")).len(), 1);
         assert_eq!(tree.find(|node| node.get("on.click") == Some("save-import")).len(), 1);
@@ -436,6 +468,29 @@ mod tests {
         // 没被确认的那一槽仍然是普通「删除」。
         assert_eq!(tree.find(|node| node.get("on.click") == Some("save-delete-ok:0")).len(), 0);
         assert_eq!(tree.find(|node| node.get("on.click") == Some("save-delete:0")).len(), 1);
+    }
+
+    #[test]
+    fn legacy_game_replaces_the_blocked_card_and_disables_import() {
+        // 手环上是 1.x 旧版、且存档协议还是通的（1.6.x 就有存档通道）：
+        // 这张「游戏版本过旧」卡**替代**「存档通道不可用」——它更具体（哪一版、怎么办），
+        // 两张一起挂只会让用户把同一件事读两遍。导入必须禁用（写进去的是 2.0 的存档结构，
+        // 旧版游戏读不懂）；导出保留 —— 卸载前把旧存档捞一份，是仅剩的后悔药。
+        let mut snapshot = page_with_saves();
+        snapshot.band_game_legacy = true;
+        snapshot.band_version = "1.6.3".into();
+        let tree = render(&snapshot);
+        let texts = tree.texts();
+        assert!(texts.iter().any(|t| t.contains("游戏版本过旧")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("1.x 旧版（v1.6.3）")), "版本号要说出来：{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("卸载")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("存档通道不可用")), "{texts:?}");
+        assert!(tree.find(|node| node.get("on.click") == Some("save-import")).is_empty(), "导入该禁用");
+        assert_eq!(tree.find(|node| node.get("on.click") == Some("save-export")).len(), 1, "导出保留");
+        assert_eq!(tree.find(|node| node.get("on.click") == Some("save-refresh")).len(), 1, "刷新保留");
+        // 夹具里有多条存档的章节没装，但旧代下**不许**再教「去推送页同步那一章」——
+        // 同步入口正被拦着，那句话与上面的卡互相打架。
+        assert!(!texts.iter().any(|t| t.contains("先在「推送」页同步那一章")), "{texts:?}");
     }
 
     #[test]

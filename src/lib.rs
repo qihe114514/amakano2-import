@@ -49,6 +49,32 @@ fn saves_capability_missing(alive: bool, save_protocol: Option<u32>) -> bool {
     alive && save_protocol.is_none()
 }
 
+/// 从手环 `hello-ok` 报来的 `appVersion`（如 "2.0.0"、"1.6.3"）里取**主版本号**。
+/// 容忍 "v2.0.0" 这类前缀；开头的非数字跳过，取不到数字返回 `None`。
+fn major_version(app_version: &str) -> Option<u32> {
+    app_version
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// `hello-ok` 到手时判定「手环上的游戏是不是 1.x 旧代」。
+///
+/// 判据：报上来的主版本号 < 2 就是旧代 —— 2.0 起存档结构与章节包格式都换了，
+/// 插件里的章节包（线路合并版）旧版游戏根本读不了，所以要拦在同步之前。
+/// 连版本号都报不上来的（`None`），只有**同时拿不出存档能力**才按旧代算：
+/// 2.x 一定既报版本又报 saves 能力，两者都缺说明是更老的 1.x；
+/// 但只缺版本号、能力齐全的，宁可放过也不误拦（界面不该凭猜测禁用同步）。
+fn hello_reports_legacy(app_version: &str, supports_saves: bool) -> bool {
+    match major_version(app_version) {
+        Some(major) => major < 2,
+        None => !supports_saves,
+    }
+}
+
 /// 把「已写完的字节数」换算成**当前分片布局下**的分片下标。
 ///
 /// `layout` 是每个分片的 `(字节数, 是不是某个文件的第一片)`。
@@ -72,6 +98,97 @@ fn resume_index_for_bytes(layout: &[(usize, bool)], done_bytes: usize) -> usize 
     }
     // 游标落在最后一片之后（手环保证 done_bytes < 总字节数，理论上到不了这里）。
     layout.len()
+}
+
+/// 把「半截文件的路径」换算成**当前分片布局下**的分片下标。
+///
+/// `layout` 是每个分片的 `(文件路径, 是不是某个文件的第一片)`。
+///
+/// 什么时候用它：断点落在**整包第一个文件**中间时，手环的字节游标恰好是 0
+/// （它算的是「已写完文件的字节数」，而这时一个文件都没写完），能指的只有那个半截文件。
+/// 路径与分片怎么切无关，所以在**当前**布局里按它重新定位比按手环报的分片下标靠谱 ——
+/// 后者只属于手环上一次那套布局（2026-10-02 真机日志：手环写了 8 KB 却回 `resumeBytes:0`，
+/// 插件只能退回用 `resumeFrom`）。
+///
+/// 找不到这个文件返回 `None`（例如那一版手环没给 `resumePath`，或包内容已经换过）。
+fn resume_index_for_path(layout: &[(String, bool)], path: &str) -> Option<usize> {
+    if path.is_empty() {
+        return None;
+    }
+    layout.iter().position(|(item, is_file_start)| *is_file_start && item == path)
+}
+
+/// **一个时间窗内**同一章最多自动重试几次（断线自动恢复的防死循环闸门）。
+const MAX_AUTO_RESUME: u8 = 3;
+/// 自动续传预算的窗口长度。窗口一过，计数作废、重新给满 `MAX_AUTO_RESUME` 次。
+///
+/// 为什么要有窗口：真机（2026-10-02 的 iPhone 日志）里链路每 1–3 分钟就断一次，
+/// 3 次预算两分钟就烧光，之后这一轮再也不自动接着传 —— 界面挂着「自动续传已达上限，
+/// 重连后点继续传输」，用户看到的就是「断点续传不工作」。窗口仍留着，是为了
+/// 「一个窗口内不许无限自动重连」这条底线。
+///
+/// 这两条与 `auto_resume_budget` 一起挂在 crate 根：纯判定 + 宿主机用例，
+/// wasm-only 的 `host` 模块里编不到（那是本仓库对「能直接判定对错的语义」的一贯做法）。
+const AUTO_RESUME_WINDOW_MS: u64 = 5 * 60 * 1000;
+
+/// 断线自动续传的次数闸门。返回 `(这次算第几次, 本次窗口起点, 还让不让自动续传)`。
+///
+/// `window_start_ms == 0` 视为「还没有窗口」（旧版本的存档、或刚被清掉），一律重新开窗。
+/// 窗口内的第 `MAX_AUTO_RESUME + 1` 次被拒 —— 拒了之后 `fail_transfer` 会把意图清掉，
+/// 于是「用户手点一次继续传输」失败之后又能拿到一整窗新预算，不必卸载重装插件。
+///
+/// 纯函数，挂在 crate 根是为了能在宿主机上直接跑用例（wasm-only 的 `host` 模块里编不到）。
+fn auto_resume_budget(now_ms: u64, window_start_ms: u64, attempts: u8) -> (u8, u64, bool) {
+    let expired = window_start_ms == 0 || now_ms.saturating_sub(window_start_ms) >= AUTO_RESUME_WINDOW_MS;
+    if expired {
+        return (1, now_ms, true);
+    }
+    let used = attempts.saturating_add(1);
+    (used, window_start_ms, used <= MAX_AUTO_RESUME)
+}
+
+/// 这次「等手环确认」的等待过期了吗？
+///
+/// **为什么必须有这条**：2026-10-02 的真机反馈是「重新连接后点继续传输不传输，速度和剩余
+/// 都显示「—」」。病因就是这一态没人回收 —— 应用进后台/被系统挂起时插件挂的 ready 定时器会丢，
+/// `transfer` 永久停在「已发请求、还没 ready」：界面上所有同步/继续按钮都被
+/// `is_transferring()`（= `started && !ready`）禁掉，`start_transfer` 一句
+/// 「同步已开始，请等待完成或失败」把每个入口都挡回去，而速度/剩余因为 `speed_kbps == 0`
+/// 永远显示「—」。用户点什么都没反应，只能重载插件。
+///
+/// 有过期判定之后：超时的等待**不再算「正在传」**（按钮重新可点），而且任何一次重新发起
+/// 都可以把这次废掉的握手丢掉重来（`deadline_ms == 0` 表示这次传输还没进过等待态）。
+///
+/// 纯函数，宿主机上有用例。
+fn ready_wait_expired(deadline_ms: u128, now_ms: u128) -> bool {
+    deadline_ms > 0 && now_ms > deadline_ms
+}
+
+/// 握手已完成之后，多久没有任何进展就把这次传输当成「已经死了」（毫秒）。
+///
+/// 为什么也要有这条：链路掉线时插件是靠**分片重传用尽**（约 16 秒）来收尾的，而重传靠的是
+/// 宿主定时器 —— 应用被系统挂起时那些定时器会丢，`transfer` 就带着 `started && ready` 一直留着。
+/// 那一态下同步按钮虽然可点，但每次发起都会被「已经有一次在跑」挡回去，用户还是动不了。
+/// 30 秒 ≈ 心跳判定掉线的三拍，与 `HEARTBEAT_MAX_MISSES` 同量级。
+const TRANSFER_SILENT_MS: u128 = 30_000;
+
+/// 这次传输还算「在跑」吗？同步/继续按钮能不能点、新的一次发起要不要被挡，都用它。
+///
+/// - 还没握手：只要「等确认」没超时就还活着（超时 = 那一次握手废了，见 `ready_wait_expired`）；
+/// - 握过手：看**最近一次进展**（确认、重传都算）离现在多久 —— 静默太久就是死了。
+///
+/// 纯函数，宿主机上有用例。
+fn transfer_live(started: bool, ready: bool, ready_deadline_ms: u128, last_progress_ms: u128, now_ms: u128) -> bool {
+    if !started {
+        return false;
+    }
+    if !ready {
+        // 「已开始、还没确认」只有在等待窗口有效期内才算在跑。
+        // 没有截止时刻（`0`，正常路径不会出现）按**不活跃**处理：宁可让用户能重来一次，
+        // 也不要因为一个缺字段的状态把人永久卡在「同步已开始」上。
+        return ready_deadline_ms > 0 && !ready_wait_expired(ready_deadline_ms, now_ms);
+    }
+    last_progress_ms > 0 && now_ms.saturating_sub(last_progress_ms) <= TRANSFER_SILENT_MS
 }
 
 // ------------------------------------------------------------------ 宿主侧实现
@@ -104,8 +221,9 @@ use crate::request::{FOLLOWUP_DELAY_MS, PendingRequest, RequestKind, Slot, Timeo
 use crate::saves;
 use crate::saves::now_ms;
 use crate::{
-    MAX_SAVE_SLOTS, SAVE_PROTOCOL, mark_first_hello_for_session, resume_index_for_bytes,
-    saves_capability_missing,
+    MAX_AUTO_RESUME, MAX_SAVE_SLOTS, SAVE_PROTOCOL, auto_resume_budget, hello_reports_legacy,
+    mark_first_hello_for_session, resume_index_for_bytes, resume_index_for_path,
+    saves_capability_missing, transfer_live,
 };
 
 // 宿主专属的两个模块：界面转换与剪贴板（都碰 `astrobox_ng_wit`）。
@@ -134,6 +252,9 @@ const MAX_TIMEOUT_MS: u64 = 4000;
 const APP_START_DELAY_MS: u64 = 2000;
 const READY_TIMEOUT_MS: u64 = 3000;
 const MAX_READY_ATTEMPTS: u8 = 2;
+/// 「已发导入请求、等手环确认」这段等待的余量（毫秒）。实际窗口是
+/// `READY_TIMEOUT_MS × (MAX_READY_ATTEMPTS + 1) + 这个余量`（见 `start_transfer`）。
+const READY_WAIT_SLACK_MS: u128 = 2_000;
 /// 连接后轮询手环应用：每 2.5 秒试一次，最多 12 次（30 秒内手动打开也能接上）。
 const PROBE_INTERVAL_MS: u64 = 2500;
 const MAX_PROBE_ATTEMPTS: u32 = 12;
@@ -144,8 +265,6 @@ const HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 const HEARTBEAT_SILENT_MS: u128 = 15_000;
 /// 连续漏几拍判定掉线。3 拍 ≈ 30 秒，用户能感觉到「连不上了」，又不会误判一次卡顿。
 const HEARTBEAT_MAX_MISSES: u32 = 3;
-/// 一次会话里同一章最多自动重试几次（断线自动恢复的防死循环闸门）。
-const MAX_AUTO_RESUME: u8 = 3;
 /// 一次存档回包最多允许多少片（手环侧是 9000 字节/片，这个上限远大于真实需要，
 /// 只是为了防止一个乱报 `seq` 的回包把内存吃掉）。
 const MAX_SAVE_SHARDS: u64 = 64;
@@ -193,6 +312,12 @@ struct Transfer {
     started: bool,
     waiting_ready: bool,
     ready_attempts: u8,
+    /// 「已发导入请求、等手环确认」这段等待的截止时刻（墙钟毫秒，0 = 还没进过这一态）。
+    /// 过期之后这次握手作废：界面按钮重新可点、同步入口允许重来（见 `ready_wait_expired`）。
+    ready_deadline_ms: u128,
+    /// 最近一次「有进展」的时刻：收到确认、收到分片确认、重传都算。
+    /// 用它判这次传输是不是已经静默死掉（`transfer_live`）。
+    last_progress_ms: u128,
     resumed: bool,
 }
 
@@ -264,13 +389,18 @@ struct State {
     /// （`connect_device()` 自己会 `block_on`，在 block_on 里再调它等于嵌套，会死锁。）
     reconnect_pending: bool,
     /// 断线前正在传的那一章 —— 重连并拿到手环断点后自动接着传。
-    /// `(章节号, 包名, 已经自动重试过几次)`。次数是防死循环的闸门。
-    auto_resume: Option<(usize, String, u8)>,
+    /// `(章节号, 包名, 本窗口内已经自动重试过几次, 本窗口起点毫秒)`。
+    /// 次数是防死循环的闸门，窗口让它**会过期**（见 `auto_resume_budget`）。
+    auto_resume: Option<(usize, String, u8, u64)>,
     library: Vec<LibraryPack>,
     library_error: String,
     sync_queue: Vec<usize>,
     /// 本次连接是否已经问过未完成传输（连上之后问一次就够）。
     pending_checked: bool,
+    /// 断点问题的**回答**是否已经到手（`amakano.pack.pending` 回包，无论手环上有没有断点）。
+    /// `pending_checked == true` 而它还是 false，就是「问了、还没答上」的查询盲区 ——
+    /// 界面在这段时间里显示「正在查询手环上的断点…」。
+    pending_answered: bool,
     status: String,
     status_kind: StatusKind,
     transfer: Option<Transfer>,
@@ -327,6 +457,15 @@ struct State {
     saves_unsupported: bool,
     /// 手环快应用版本（hello-ok 里带回来的），用于「版本过旧」的提示。
     band_version: String,
+    /// 手环上的游戏是 **1.x 旧代**（hello-ok 报的主版本号 < 2，或应用活着却始终
+    /// 协商不出存档协议 —— 连 hello 通道都没有的更老版本）。
+    ///
+    /// 2.0 起存档结构与章节包格式都已更换，旧版游戏读不了新章节包，所以判定成立时：
+    /// 界面挂「卸载重装」卡片、禁用同步入口，并清掉排队中的章节。
+    /// 与 `saves_unsupported` 同一模式：只在**结论真正落地的时刻**写入
+    /// （hello-ok 解析 / 存档请求超时归因），连接重置，不做渲染期派生 ——
+    /// 连接后 hello 还没回来的那几秒里「alive 但无协议」是正常等待，不是证据。
+    band_game_legacy: bool,
     /// 等待二次确认删除的存档槽；`None` 表示没有。自动存档是 `"auto"`。
     confirm_delete_save: Option<String>,
     /// 存档操作进行中（对话框/等待回包），期间禁用存档页的动作按钮。
@@ -377,6 +516,7 @@ fn state() -> &'static Mutex<State> {
             library_error: String::new(),
             sync_queue: Vec::new(),
             pending_checked: false,
+            pending_answered: false,
             status: "先点「连接设备」，再在章节列表里点「同步」".into(),
             status_kind: StatusKind::Info,
             transfer: None,
@@ -403,6 +543,7 @@ fn state() -> &'static Mutex<State> {
             save_protocol: None,
             saves_unsupported: false,
             band_version: String::new(),
+            band_game_legacy: false,
             confirm_delete_save: None,
             saves_busy: false,
             saves_notice: String::new(),
@@ -490,6 +631,8 @@ fn transfer_with_chunks(chunk_bytes: usize, chunks: Vec<TransferChunk>) -> Trans
         started: false,
         waiting_ready: false,
         ready_attempts: 0,
+        ready_deadline_ms: 0,
+        last_progress_ms: 0,
         resumed: false,
     }
 }
@@ -575,7 +718,7 @@ fn library_summary(packs: &[LibraryPack]) -> String {
     let scenes: usize = packs.iter().map(|pack| pack.scenes).sum();
     let dialogues: usize = packs.iter().map(|pack| pack.dialogues).sum();
     format!(
-        "内置 {} 章 · {scenes} 场景 · {dialogues} 句对白 · {} · 约 {} 小时 {} 分钟",
+        "内置 {} 章 · {scenes} 场景 · {dialogues} 句对白 · {} · 阅读时长约 {} 小时 {} 分钟",
         packs.len(),
         human_bytes(bytes),
         minutes / 60,
@@ -595,6 +738,17 @@ fn find_library_pack(number: usize) -> Option<LibraryPack> {
 
 /// 把内置章节包读入内存，切成当前分片大小的传输块，然后发 begin。
 fn start_embedded_transfer(number: usize) {
+    // **旧代拦截是硬闸门**：手环上是 1.x 游戏时，2.0 的线路合并包（packId=章节身份、
+    // p00 公共资源包）旧版根本读不了，传上去就是一堆死登记。单章同步、批量队列、
+    // 断点续传、自动恢复全都汇到这一个入口，在这里拦一次就够。
+    if update(|state| state.band_game_legacy) {
+        set_status(
+            StatusKind::Bad,
+            "手环上的游戏是 1.x 旧版，读不了 2.0 的章节包：请先卸载游戏、重装 2.0 版再同步",
+        );
+        render();
+        return;
+    }
     let Some(pack) = find_library_pack(number) else {
         set_status(StatusKind::Bad, format!("找不到第 {number} 章，请检查插件内的章节清单"));
         render();
@@ -648,18 +802,62 @@ fn start_embedded_transfer(number: usize) {
         state.pack_files = files;
         state.pack_meta = Some(meta.clone());
         if matches_resume {
-            message = format!("{}（约 {} 分钟）与未完成传输匹配，正在接着传", meta.name, pack.minutes);
+            message = format!("{}（阅读约 {} 分钟）与未完成传输匹配，正在接着传", meta.name, pack.minutes);
         } else {
             if state.resume.is_some() {
                 state.resume = None;
                 kind = StatusKind::Warn;
             }
-            message = format!("正在同步 {}（约 {} 分钟 · {count} 个分片）", meta.name, pack.minutes);
+            message = format!("正在同步 {}（全文阅读约 {} 分钟 · {count} 个分片）", meta.name, pack.minutes);
         }
     });
     set_status(kind, message);
     render();
     astrobox_ng_wit::block_on(async { start_transfer().await });
+}
+
+/// 「继续传输」：把手环保留的断点（`state.resume`）翻译成对那一章的传输。
+///
+/// 断点的权威在手环（`amakano.pack.pending` 回包建立的 `ResumeInfo`），
+/// `start_embedded_transfer` 内部会按字节游标续传（`matches_resume`）——
+/// 这里只负责把 `pack_id` 映射回章节号。这是断点卡片「继续传输」按钮的落点：
+/// 旧版断点卡片只有指路文案、没有动作，用户重连后找不到明确的「继续」入口。
+///
+/// ⚠️ **「有一个 transfer」不等于「在传」**：`transfer.started` 在「已发请求、还没等到
+/// 手环确认」这一态下也是 true，而那一态会因为应用被挂起时插件定时器丢失而**永久停在原地**。
+/// 旧写法只判 `started`，于是那种情况下点「继续传输」什么都不发生（状态行还给一句
+/// 跟断点无关的「手环上没有可继续的断点」）—— 2026-10-02 的真机原话。
+/// 现在只把「真的还在跑」的传输当占用：等到确认的（`ready`）或等待还没过期的。
+fn resume_transfer() {
+    let (target, busy) = {
+        let current = state().lock().unwrap_or_else(|error| error.into_inner());
+        let now = now_ms();
+        let busy = current
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer_live(transfer.started, transfer.ready, transfer.ready_deadline_ms, transfer.last_progress_ms, now));
+        if busy {
+            // 正在传：断点卡根本不会出现，这个动作不该被触发。
+            (None, true)
+        } else {
+            let pack_id = current.resume.as_ref().map(|item| item.pack_id.clone());
+            let number = pack_id.and_then(|id| {
+                current.library.iter().find(|pack| pack.id == id).map(|pack| pack.number)
+            });
+            (number, false)
+        }
+    };
+    match target {
+        Some(number) => start_embedded_transfer(number),
+        None if busy => {
+            set_status(StatusKind::Warn, "上一轮传输还没结束（也没失败）：等它超时（约 20 秒）后「继续/重传」会重新可点");
+            render();
+        }
+        None => {
+            set_status(StatusKind::Warn, "手环上没有可继续的断点，请在推送页选择章节同步");
+            render();
+        }
+    }
 }
 
 /// 依次同步队列里的章节。
@@ -801,6 +999,9 @@ fn snapshot() -> Snapshot {
             resumed: transfer.resumed,
             ready: transfer.ready,
             started: transfer.started,
+            // 这次传输已经不再活跃（等待确认过期，或握手完成后长时间静默）：
+            // 界面据此把按钮放回来、别再把它当成「传输中」占着卡片。
+            stalled: !transfer_live(transfer.started, transfer.ready, transfer.ready_deadline_ms, transfer.last_progress_ms, now_ms()),
             chunk_bytes: transfer.chunk_bytes,
         }
     });
@@ -818,6 +1019,16 @@ fn snapshot() -> Snapshot {
         files_done: pending.files_done,
         resume_from: pending.resume_from,
     });
+
+    // 断点查询盲区：手环应用活着、断点问题已经问出去但回答还没到。
+    // 这段时间界面显示「正在查询手环上的断点…」，而不是什么都不说 ——
+    // 重连后到断点出现之间可能隔好几秒（列表 → pending 两个往返），空白会被当成「没了」。
+    let resume_checking = current.connected
+        && current.alive
+        && current.pending_checked
+        && !current.pending_answered
+        && current.resume.is_none()
+        && !current.transfer.as_ref().is_some_and(|transfer| transfer.started);
 
     // 日志行只在设置页（日志就住在那儿）才克隆（最多 240 行），别的页面只要级别计数。
     let logs = if current.page == Page::Settings { logger::snapshot() } else { Vec::new() };
@@ -842,6 +1053,7 @@ fn snapshot() -> Snapshot {
         installed,
         transfer,
         resume,
+        resume_checking,
         cache_bytes: current.cache_bytes,
         cache_files: current.cache_files,
         chunk_bytes: current.chunk_bytes,
@@ -867,6 +1079,7 @@ fn snapshot() -> Snapshot {
         saves_unsupported: current.saves_unsupported,
         saves_busy: current.saves_busy,
         band_version: current.band_version.clone(),
+        band_game_legacy: current.band_game_legacy,
         saves_notice: current.saves_notice.clone(),
         save_export: current
             .save_export
@@ -1191,6 +1404,16 @@ fn fail_request(kind: RequestKind) {
         update(|state| {
             if saves_blocked {
                 state.saves_unsupported = true;
+                // 应用活着（答过章节列表）却始终协商不出协议：连 hello 通道都没有，
+                // 一定是 1.x 旧代 —— 推送页的「卸载重装」卡片由此点亮，同步入口一并拦下
+                // （章节包同样是换代格式，传了也没用）。
+                //
+                // ⚠️ **这条路上不清 `sync_queue` / `auto_resume`**：这是**推测**（真 1.x 是
+                // 一码事，应用单纯忙半拍导致 hello 超时是另一码事），而队列是用户的批次意图。
+                // 猜错就毁掉一整批任务，代价不对称。队列留在那儿只是显示成「排队中」（同步入口
+                // 本来就被拦着），hello 一旦真的答上（10 秒一次的心跳会再问），hello-ok 那条
+                // 权威路径会把状态连同队列一起收拾干净。
+                state.band_game_legacy = true;
             } else if state.saves_error.is_empty() {
                 state.saves_error = message.into();
             }
@@ -1285,29 +1508,36 @@ async fn send_next_packet() {
 /// 断点本身不会因此丢：权威进度在手环的 `pending-install` 里，这里放开的只是
 /// 「当前这一章正在传」这个**会话内**状态，让按钮重新可点。
 fn fail_transfer(code: ErrorCode, reason: &str) {
+    // 自动续传的预算耗尽与否决定状态行说什么：还有预算就说「自动接着传」，
+    // 耗尽了就明说「要点继续传输」—— 旧版这里静默放弃，界面还挂着「正在自动重连并接着传」，
+    // 用户等来的却是什么都不发生。
+    let mut exhausted = false;
     update(|state| {
         if let Some(transfer) = state.transfer.as_mut() {
             transfer.started = false;
             transfer.ready = false;
             transfer.waiting_ready = false;
+            transfer.ready_deadline_ms = 0;
+            transfer.last_progress_ms = 0;
             transfer.in_flight.clear();
             transfer.window_size = INITIAL_WINDOW;
         }
         // 记下「刚才在传哪一章」—— 重连并拿到手环断点后自动接着传。
-        // **必须在清 `pack_meta` 之前取**。次数是防死循环的闸门：同一章最多自动重试
-        // `MAX_AUTO_RESUME` 次，超了就留给用户决定。
+        // **必须在清 `pack_meta` 之前取**。次数是防死循环的闸门：一个时间窗内最多自动重试
+        // `MAX_AUTO_RESUME` 次（见 `auto_resume_budget`），超了就留给用户决定。
         if let Some(meta) = state.pack_meta.as_ref() {
-            let attempts = state
-                .auto_resume
-                .as_ref()
-                .filter(|(_, id, _)| *id == meta.pack_id)
-                .map(|(_, _, attempts)| *attempts)
-                .unwrap_or(0);
-            if attempts < MAX_AUTO_RESUME {
-                state.auto_resume = Some((meta.chapter_number, meta.pack_id.clone(), attempts + 1));
+            let pack_id = meta.pack_id.clone();
+            let chapter_number = meta.chapter_number;
+            let previous = state.auto_resume.as_ref().filter(|item| item.1 == pack_id);
+            let attempts = previous.map(|item| item.2).unwrap_or(0);
+            let window_start = previous.map(|item| item.3).unwrap_or(0);
+            let (used, window_start, allowed) = auto_resume_budget(now_ms() as u64, window_start, attempts);
+            if allowed {
+                state.auto_resume = Some((chapter_number, pack_id, used, window_start));
             } else {
-                tracing::warn!(attempts, pack = %meta.pack_id, "auto-resume budget exhausted");
+                tracing::warn!(attempts = used, pack = %pack_id, "auto-resume budget exhausted");
                 state.auto_resume = None;
+                exhausted = true;
             }
         }
         state.transfer = None;
@@ -1316,7 +1546,11 @@ fn fail_transfer(code: ErrorCode, reason: &str) {
         // 阶段退回到「应用活着」：链路断了，后面的章节列表/传输都还不成立。
         state.stage = state.stage.min(SessionStage::AppAlive);
         state.error = Some(ErrorView::new(code, reason));
-        state.status = format!("连接已断开（{reason}）。正在自动重连并接着传（也可以在 AstroBox 里手动重连）");
+        state.status = if exhausted {
+            format!("连接已断开（{reason}）。自动续传已达上限，重连后点「继续传输」接着传")
+        } else {
+            format!("连接已断开（{reason}）。正在自动重连并接着传（也可以在 AstroBox 里手动重连）")
+        };
         state.status_kind = StatusKind::Bad;
         // 断线恢复不该等用户点：直接排队一次自动重连（由 `on_event` 在 block_on 之外执行）。
         state.reconnect_pending = true;
@@ -1354,6 +1588,8 @@ fn retry_packet(payload: &str) -> Option<RetryAction> {
         return Some(RetryAction::Failed);
     }
     transfer.retry_count += 1;
+    // 重传也算「有进展」：静默判据看的是「还有没有人在推这次传输」，不是「有没有传成功」。
+    transfer.last_progress_ms = now_ms();
     // **窗口减半，不是永久设成 1。** 旧实现一句 `window_size = 1` 之后整章退化成停等
     // （真机实测 872 ms/片、一整章要好几分钟），而且再没有任何路径把它涨回去。
     // 这里按 AIMD 的乘法减小处理，后面在确认分支里做加法增长。
@@ -1487,11 +1723,28 @@ fn connect_device() {
             state.stage = SessionStage::DeviceFound;
             state.error = None;
             state.installed_broken.clear();
+            // 代际判定也按**本次会话的新证据**重来：上一轮的「1.x 旧版」可能已经被用户
+            // 卸载重装解决了，别让旧结论盖着新会话（hello-ok 一到就会重新给出判定）。
+            state.band_game_legacy = false;
             state.heartbeat_misses = 0;
             state.last_alive_ms = now_ms();
             state.reconnect_pending = false;
             state.pending_checked = false;
-            state.sync_queue.clear();
+            state.pending_answered = false;
+            // 「已发导入请求、还没等到手环确认」的那次握手**属于上一条链路**：新会话不可能
+            // 再有人来应答它。留着它就等于把这次传输永久挂在「正在传」上 ——
+            // 界面所有同步/继续按钮被 `is_transferring()` 禁掉、速度与剩余永远显示「—」，
+            // 用户点什么都没反应（2026-10-02 真机：重连后点「继续传输」不传输）。
+            // 断点本身不会因此丢：它在手环的 `pending-install.txt` 里，接着传由
+            // `amakano.pack.pending` + 自动续传/「继续传输」重新发起。
+            if state.transfer.as_ref().is_some_and(|transfer| !transfer.ready) {
+                state.transfer = None;
+                state.pack_meta = None;
+                state.pack_files = Vec::new();
+            }
+            // **多章队列不许在这里清**：重连（含断线自动重连）不是用户的本意，
+            // 「同步剩余 N 章」的意图要活过断线 —— 当前那章由断点续传/「继续传输」接上，
+            // 传完 `pop_sync_queue` 自然继续剩下的。清掉它等于一次断线毁掉整批任务。
             state.status = "正在连接手环…".into();
             state.status_kind = StatusKind::Info;
         });
@@ -1854,6 +2107,10 @@ struct Persisted {
     auto_resume_pack: String,
     #[serde(default, rename = "autoResumeAttempts")]
     auto_resume_attempts: u8,
+    /// 自动续传预算窗口的起点（墙钟毫秒）。**必须落盘**：窗口判定要跨插件重启成立，
+    /// 否则每次重载都会白送一整窗预算（那就不是闸门了）。
+    #[serde(default, rename = "autoResumeWindowStart")]
+    auto_resume_window_start: u64,
 }
 
 /// 落盘一次。失败只记日志、**绝不打断任何流程** —— 存不下偏好不该让同步失败。
@@ -1864,9 +2121,10 @@ fn save_persisted() {
             chunk_bytes: current.chunk_bytes,
             auto_launch: Some(current.auto_launch),
             queue: current.sync_queue.clone(),
-            auto_resume_chapter: current.auto_resume.as_ref().map(|(number, _, _)| *number),
-            auto_resume_pack: current.auto_resume.as_ref().map(|(_, id, _)| id.clone()).unwrap_or_default(),
-            auto_resume_attempts: current.auto_resume.as_ref().map(|(_, _, attempts)| *attempts).unwrap_or(0),
+            auto_resume_chapter: current.auto_resume.as_ref().map(|item| item.0),
+            auto_resume_pack: current.auto_resume.as_ref().map(|item| item.1.clone()).unwrap_or_default(),
+            auto_resume_attempts: current.auto_resume.as_ref().map(|item| item.2).unwrap_or(0),
+            auto_resume_window_start: current.auto_resume.as_ref().map(|item| item.3).unwrap_or(0),
         }
     };
     match serde_json::to_string(&data) {
@@ -1905,7 +2163,7 @@ fn load_persisted() {
         state.sync_queue = saved.queue.into_iter().filter(|number| *number >= 1).collect();
         if let Some(number) = saved.auto_resume_chapter {
             if !saved.auto_resume_pack.is_empty() {
-                state.auto_resume = Some((number, saved.auto_resume_pack, saved.auto_resume_attempts.min(MAX_AUTO_RESUME)));
+                state.auto_resume = Some((number, saved.auto_resume_pack, saved.auto_resume_attempts.min(MAX_AUTO_RESUME), saved.auto_resume_window_start));
             }
         }
     });
@@ -1972,7 +2230,11 @@ async fn start_transfer() {
             let meta = current.pack_meta.clone();
             match (meta, current.transfer.as_mut()) {
                 (Some(meta), Some(transfer)) => {
-                    if transfer.started && transfer.waiting_ready {
+                    // 已经有一次传输在跑：**只有它真的还活着时才拒绝重来**。
+                    // 「等确认」的窗口会过期、「握手完成」之后长时间静默也算死 —— 两种情况下都必须
+                    // 允许重发，否则用户点什么都被这里挡回去、界面上速度与剩余永远是「—」
+                    // （应用被挂起时插件挂的定时器会丢，这些状态就再也没人回收）。
+                    if transfer_live(transfer.started, transfer.ready, transfer.ready_deadline_ms, transfer.last_progress_ms, now_ms()) {
                         None
                     } else {
                         transfer.request_id = format!("pack-{}", now_ms());
@@ -1987,6 +2249,11 @@ async fn start_transfer() {
                         transfer.started = true;
                         transfer.waiting_ready = true;
                         transfer.ready_attempts = 1;
+                        // 等待窗口从这一刻重新起算（`READY_TIMEOUT_MS` 的重发次数 + 余量）。
+                        transfer.ready_deadline_ms = now_ms()
+                            + READY_TIMEOUT_MS as u128 * (MAX_READY_ATTEMPTS as u128 + 1)
+                            + READY_WAIT_SLACK_MS;
+                        transfer.last_progress_ms = now_ms();
                         transfer.resumed = false;
                         transfer.in_flight.clear();
                         Some((addr, transfer.request_id.clone(), begin_packet(&meta, transfer)))
@@ -1998,7 +2265,10 @@ async fn start_transfer() {
     };
     let Some((addr, request_id, payload)) = packet else {
         update(|state| {
-            if state.transfer.as_ref().map(|transfer| transfer.started && transfer.waiting_ready).unwrap_or(false) {
+            let live = state.transfer.as_ref().is_some_and(|transfer| {
+                transfer_live(transfer.started, transfer.ready, transfer.ready_deadline_ms, transfer.last_progress_ms, now_ms())
+            });
+            if live {
                 state.status = "同步已开始，请等待完成或失败".into();
                 state.status_kind = StatusKind::Info;
             } else if state.pack_meta.is_none() {
@@ -2030,13 +2300,20 @@ async fn start_transfer() {
     render();
 }
 
-fn apply_ready(transfer: &mut Transfer, reported_from: usize, resume_bytes: usize, resumed: bool) {
+fn apply_ready(transfer: &mut Transfer, reported_from: usize, resume_bytes: usize, resume_path: &str, resumed: bool) {
     // **以字节游标为准。** 手环回的 `resumeFrom` 是上一次那套布局里的下标，换过分片档位
     // 之后不能用；`resumeBytes`（已写完文件的字节数之和）跟分片怎么切无关，
     // 按它在**当前**布局里重新定位，换档最多重传一个文件。
+    //
+    // 游标为 0 但手环给了半截文件名（断点落在整包**第一个文件**中间 —— 这时
+    // 「已写完文件的字节数」确实是 0）时按**文件路径**定位：路径与分片怎么切无关，
+    // 比手环报的分片下标可靠。两条路都走不通才退回手环报的下标。
     let resume_from = if resume_bytes > 0 {
         let layout: Vec<(usize, bool)> = transfer.chunks.iter().map(|chunk| (chunk.bytes, !chunk.append)).collect();
         resume_index_for_bytes(&layout, resume_bytes)
+    } else if !resume_path.is_empty() {
+        let layout: Vec<(String, bool)> = transfer.chunks.iter().map(|chunk| (chunk.path.clone(), !chunk.append)).collect();
+        resume_index_for_path(&layout, resume_path).unwrap_or_else(|| reported_from.min(transfer.chunks.len()))
     } else {
         reported_from.min(transfer.chunks.len())
     };
@@ -2054,6 +2331,9 @@ fn apply_ready(transfer: &mut Transfer, reported_from: usize, resume_bytes: usiz
     transfer.ready = true;
     transfer.started = true;
     transfer.waiting_ready = false;
+    // 确认已到，等待窗口作废（它只管「还没等到确认」那一段）。
+    transfer.ready_deadline_ms = 0;
+    transfer.last_progress_ms = now_ms();
     transfer.resumed = resumed || resume_from > 0;
 }
 
@@ -2080,10 +2360,12 @@ fn handle_interconnect(payload: &str) -> bool {
             });
             update(|state| {
                 state.resume = pending;
+                // 断点问题的回答到手了：查询盲区到此结束（无论手环上有没有断点）。
+                state.pending_answered = true;
                 state.status = match state.resume.as_ref() {
                     Some(pending) => {
                         let percent = if pending.bytes > 0 { pending.received_bytes * 100 / pending.bytes } else { 0 };
-                        format!("发现未完成传输：{} · 已传 {}%，到「推送」页接着传", pending.chapter_name, percent)
+                        format!("发现未完成传输：{} · 已传 {}%，点「继续传输」接着传", pending.chapter_name, percent)
                     }
                     None => "手环上没有未完成的传输".into(),
                 };
@@ -2105,7 +2387,7 @@ fn handle_interconnect(payload: &str) -> bool {
             let resume_now = update(|state| {
                 let pending_id = state.resume.as_ref().map(|item| item.pack_id.clone());
                 match (&state.auto_resume, pending_id) {
-                    (Some((number, id, _)), Some(pending)) if *id == pending => {
+                    (Some((number, id, _, _)), Some(pending)) if *id == pending => {
                         let number = *number;
                         state.auto_resume = None;
                         Some(number)
@@ -2235,6 +2517,14 @@ fn handle_interconnect(payload: &str) -> bool {
             let first_hello = update(|state| mark_first_hello_for_session(state.session, &mut state.hello_ok_session));
             update(|state| {
                 state.band_version = version.clone();
+                // 代际判定：1.x 旧代就置位，并清掉「排队中的章节」与「断线自动续传」的意图 ——
+                // 旧版游戏读不了 2.0 的章节包，排队的章节不该再传
+                // （传输入口 `start_embedded_transfer` 里还有第二道闸，这里是意图层）。
+                state.band_game_legacy = hello_reports_legacy(&version, supports_saves);
+                if state.band_game_legacy {
+                    state.sync_queue.clear();
+                    state.auto_resume = None;
+                }
                 state.save_protocol = (protocol >= SAVE_PROTOCOL && supports_saves).then_some(protocol);
                 state.stats_supported = supports_stats;
                 // 不支持就把上一次的统计清掉：留着旧数据会让「版本过旧」那张卡和一堆
@@ -2252,8 +2542,16 @@ fn handle_interconnect(payload: &str) -> bool {
                     if state.error.as_ref().map(|error| error.code) == Some(ErrorCode::Protocol) {
                         state.error = None;
                     }
-                    state.status = format!("手环端支持存档管理（应用 v{version} · 协议 {protocol}）");
-                    state.status_kind = StatusKind::Good;
+                    // 1.x 旧代但存档协议是通的（1.6.x 就有存档通道）：协议协商成功的话照说，
+                    // 但「游戏是旧版、要卸载重装」这件事必须占住状态行 —— 2.0 起存档结构
+                    // 和章节包都换了，这条比「支持存档管理」更要紧。
+                    if state.band_game_legacy {
+                        state.status = format!("手环上的游戏是 1.x 旧版（v{version}）：存档结构与章节包已换代，请卸载游戏并重装 2.0 版");
+                        state.status_kind = StatusKind::Warn;
+                    } else {
+                        state.status = format!("手环端支持存档管理（应用 v{version} · 协议 {protocol}）");
+                        state.status_kind = StatusKind::Good;
+                    }
                 } else {
                     // 回了但能力不够：同样归到「手环端应用版本过旧」，只置状态位，
                     // 卡片的结论 + 怎么办由界面统一给（那句「报告协议 x、能力 [ ]」的细节
@@ -2267,6 +2565,10 @@ fn handle_interconnect(payload: &str) -> bool {
             // 是不是本次会话的**首条** hello：心跳也走同一条 `hello`，如果每次回包都补拉列表，
             // 10 秒一次的探测就变成「10 秒一次 storage 读 + 10 秒一次注册表重写」，
             // 白搅动手环的内存与闪存。
+            if update(|state| state.band_game_legacy) {
+                // 排队意图被清掉了，落盘的那份也要跟上（`on_load` 恢复时才不会复活旧队列）。
+                save_persisted();
+            }
             render();
             // **握手成功 = 手环应用已经活过来了 → 必须补一次章节列表。**
             //
@@ -2302,7 +2604,10 @@ fn handle_interconnect(payload: &str) -> bool {
                     stats_list: false,
                 });
             }
-            if first_hello && supports_saves && protocol >= SAVE_PROTOCOL {
+            // 1.x 旧代时状态行留住那句「卸载重装」，别被「正在读取手环存档…」盖掉 ——
+            // 存档列表照拉（读取无害，卡片还在推送页挂着），但最要紧的话必须是这句。
+            let legacy = update(|state| state.band_game_legacy);
+            if first_hello && supports_saves && protocol >= SAVE_PROTOCOL && !legacy {
                 // 协商成功就顺手拉一次存档列表，用户切到「存档」页时数据已经在了。
                 //
                 // ⚠️ **不许在这里直接发**：实测「收到一条回包之后几毫秒内就发出下一个请求」
@@ -2546,13 +2851,15 @@ fn handle_interconnect(payload: &str) -> bool {
             // 权威游标：已写完文件的字节数之和。手环没给（旧版）就退回按分片下标续，
             // 也就是以前的行为。
             let resume_bytes = message.get("resumeBytes").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let resumed = message.get("resumed").and_then(Value::as_bool).unwrap_or(false) || resume_bytes > 0;
+            // 半截文件的路径。游标为 0 时它是唯一的锚点（见 `apply_ready`）。
+            let resume_path = message.get("resumePath").and_then(Value::as_str).unwrap_or("").to_string();
+            let resumed = message.get("resumed").and_then(Value::as_bool).unwrap_or(false) || resume_bytes > 0 || !resume_path.is_empty();
             let mut should_send = false;
             let mut resumed_now = false;
             let mut next_index = 0;
             update(|state| {
                 if let Some(item) = state.transfer.as_mut() {
-                    apply_ready(item, resume_from, resume_bytes, resumed);
+                    apply_ready(item, resume_from, resume_bytes, &resume_path, resumed);
                     resumed_now = item.resumed;
                     next_index = item.next_index;
                     should_send = true;
@@ -2613,6 +2920,7 @@ fn handle_interconnect(payload: &str) -> bool {
                             .unwrap_or(now);
                         let sample = now.saturating_sub(sent_at) as u64;
                         item.rtt_ms = if item.rtt_ms == 0 { sample } else { (item.rtt_ms * 3 + sample) / 4 };
+                        item.last_progress_ms = now;
                         let mut bytes = 0usize;
                         for (value, _) in &cleared {
                             if let Some(chunk) = item.chunks.get(*value) {
@@ -3059,6 +3367,7 @@ fn handle_action(action: Action) {
             queue_sync(queue);
         }
         Action::Sync(number) => start_embedded_transfer(number),
+        Action::Resume => resume_transfer(),
         Action::RefreshList => run_refresh(action.refresh_plan()),
         Action::ClearCache => astrobox_ng_wit::block_on(async { request_clear_cache().await }),
         // 章节包删除**一步到位**：插件里有一份完整副本，删掉随时能重新同步回来，
@@ -3469,7 +3778,8 @@ astrobox_ng_wit::export!(ImportPlugin with_types_in astrobox_ng_wit);
 #[cfg(test)]
 mod tests {
     use crate::{
-        MAX_SAVE_SLOTS, SAVE_PROTOCOL, mark_first_hello_for_session, saves, saves_capability_missing,
+        MAX_SAVE_SLOTS, SAVE_PROTOCOL, hello_reports_legacy, major_version, mark_first_hello_for_session,
+        saves, saves_capability_missing,
     };
 
     /// 「版本或协议不匹配」的判据必须有两半：应用已经活着 + 协议没协商出来。
@@ -3480,6 +3790,29 @@ mod tests {
         assert!(saves_capability_missing(true, None), "应用活着但协商不出协议：这才是版本/协议问题");
         assert!(!saves_capability_missing(true, Some(SAVE_PROTOCOL)), "协商成功就不该再判成版本问题");
         assert!(!saves_capability_missing(false, Some(SAVE_PROTOCOL)), "上一会话残留的能力值不能顶替「应用活着」");
+    }
+
+    /// 主版本号从 `hello-ok` 的 `appVersion` 里取：容忍 "v" 前缀，取不到数字就是 `None`。
+    #[test]
+    fn 主版本号只认开头的数字() {
+        assert_eq!(major_version("2.0.0"), Some(2));
+        assert_eq!(major_version("2.10.3"), Some(2));
+        assert_eq!(major_version("1.6.3"), Some(1));
+        assert_eq!(major_version("v2.0.0"), Some(2), "带 v 前缀也要认");
+        assert_eq!(major_version("未知"), None);
+        assert_eq!(major_version(""), None);
+    }
+
+    /// 1.x 旧代判定：报上来的主版本 < 2 就是旧代；报不上版本号时，
+    /// 只有**同时拿不出存档能力**才按旧代算 —— 2.x 一定两样都报。
+    #[test]
+    fn 游戏代际判定_两样都报才算新版() {
+        assert!(hello_reports_legacy("1.6.3", true), "1.x 就是有存档通道也要拦：存档结构和包格式都换了");
+        assert!(hello_reports_legacy("1.0.0", false));
+        assert!(!hello_reports_legacy("2.0.0", true));
+        assert!(!hello_reports_legacy("2.5.1", false), "2.x 报什么能力都不拦：版本号是唯一判据");
+        assert!(hello_reports_legacy("未知", false), "版本号都没有、能力也缺：更老的 1.x");
+        assert!(!hello_reports_legacy("未知", true), "能力齐全只是没报版本：宁可放过也不误拦同步");
     }
 
     #[test]
@@ -3654,5 +3987,76 @@ mod tests {
         // 重复的那些会被覆盖（不是丢），所以「跳过」这个词在这句里是准确的。
         let notice = amakano2_ui::SaveImportView { incoming: 5, duplicates: 2, existing: 3 }.notice();
         assert_eq!(notice, "导入 3 个存档，跳过 2 个重复（手环上现在有 6 条）");
+    }
+
+    /// 游标为 0 时按**半截文件的路径**定位续传起点。
+    ///
+    /// 断点落在整包第一个文件中间时，手环的字节游标恰好是 0（它算的是「已写完文件的
+    /// 字节数」），能指的只有那个半截文件 —— 而路径与分片怎么切无关，所以在当前布局里
+    /// 按它定位比按手环报的分片下标靠谱（下标只属于手环上一次那套布局）。
+    /// 真机依据：2026-10-02 的 iPhone 日志，手环写了 8 KB 却回 `resumeBytes:0`。
+    #[test]
+    fn resume_index_falls_back_to_the_partial_file_path() {
+        let layout = [
+            ("images/a.png".to_string(), true),
+            ("images/a.png".to_string(), false),
+            ("images/b.png".to_string(), true),
+            ("scripts/x.txt".to_string(), true),
+        ];
+        assert_eq!(crate::resume_index_for_path(&layout, "images/a.png"), Some(0), "整包第一个文件 → 第 0 片");
+        assert_eq!(crate::resume_index_for_path(&layout, "images/b.png"), Some(2), "第一个文件之后的文件照样能定位");
+        assert_eq!(crate::resume_index_for_path(&layout, "images/zzz.png"), None, "布局里没有这个文件 → 不猜");
+        assert_eq!(crate::resume_index_for_path(&layout, ""), None, "旧版手环不给 resumePath → 不猜");
+        // 只认文件的第一片：半截文件的后续片不能当起点。
+        let index = crate::resume_index_for_path(&layout, "images/a.png").unwrap();
+        assert!(layout[index].1, "定位结果必须落在文件边界上");
+    }
+
+    /// 自动续传预算：**一个时间窗内**最多 `MAX_AUTO_RESUME` 次，窗口一过重新给满。    ///
+    /// 旧行为是「同一章一辈子 3 次」并且次数落盘 —— 真机里一次链路抖动就把 3 次烧光，
+    /// 之后这一轮再也不自动接着传（界面挂着「自动续传已达上限」），用户看到的就是
+    /// 「断点续传不工作」。这条用例盯的就是「窗口内仍然是闸门、窗口外能自愈」。
+    #[test]
+    fn auto_resume_budget_is_a_window_not_a_lifetime_cap() {
+        let zero = 1_790_000_000_000u64;
+        // 没有窗口（旧存档 / 刚清空）→ 立刻开窗，从第 1 次算起。
+        assert_eq!(crate::auto_resume_budget(zero, 0, 0), (1, zero, true));
+        // 窗口内：3 次放行，第 4 次拒绝，且窗口起点不许被推后（否则又会无限续）。
+        assert_eq!(crate::auto_resume_budget(zero + 1000, zero, 0), (1, zero, true));
+        assert_eq!(crate::auto_resume_budget(zero + 2000, zero, 1), (2, zero, true));
+        assert_eq!(crate::auto_resume_budget(zero + 3000, zero, 2), (3, zero, true));
+        assert_eq!(crate::auto_resume_budget(zero + 4000, zero, 3), (4, zero, false), "窗口内第 4 次必须被拒");
+        // 窗口过期 → 计数作废、重新开窗。
+        let later = zero + crate::AUTO_RESUME_WINDOW_MS;
+        assert_eq!(crate::auto_resume_budget(later, zero, 3), (1, later, true), "窗口一过重新给满");
+        // 落盘的次数上限被截到 MAX_AUTO_RESUME，不会因为旧存档里的脏数字放行更多次。
+        assert_eq!(crate::MAX_AUTO_RESUME, 3);
+        assert_eq!(crate::auto_resume_budget(zero + 1, zero, u8::MAX), (u8::MAX, zero, false), "饱和加不 panic");
+    }
+
+    /// 一次传输还算不算「在跑」（同步/继续按钮能不能点、新的一次发起要不要被挡）。
+    ///
+    /// 真机原话（2026-10-02）：**重新连接后点「继续传输」不传输，速度和剩余都显示「—」**。
+    /// 病因是这一态没人回收 —— 应用被挂起时插件挂的定时器会丢，`transfer` 带着
+    /// `started` 一直留着，界面上所有同步按钮被禁、每个入口都被一句「同步已开始」挡回去。
+    #[test]
+    fn transfer_liveness_expires_instead_of_hanging_forever() {
+        let zero = 1_790_000_000_000u128;
+        let deadline = zero + 11_000; // 3 秒 × (2 次重发 + 1) + 2 秒余量
+        // 没开始过 = 不活跃（按钮可点、可以发起）。
+        assert_eq!(crate::transfer_live(false, false, deadline, zero, zero), false);
+        // 已发请求、还没等到确认：窗口内算在跑，超时就作废。
+        assert_eq!(crate::transfer_live(true, false, deadline, zero, zero + 1_000), true, "还在等确认");
+        assert_eq!(crate::transfer_live(true, false, deadline, zero, deadline), true, "正好到点仍算在跑");
+        assert_eq!(crate::transfer_live(true, false, deadline, zero, deadline + 1), false, "过期 = 可以重来");
+        // 没有截止时刻（不该有，但旧状态可能缺）→ 不活跃，别把用户卡死。
+        assert_eq!(crate::transfer_live(true, false, 0, zero, zero), false);
+        // 握手完成之后看「最近一次进展」：刚确认过 = 在跑；静默超过窗口 = 已经死了。
+        let ack = zero + 100_000;
+        assert_eq!(crate::transfer_live(true, true, 0, ack, ack + 1_000), true, "刚收到确认");
+        assert_eq!(crate::transfer_live(true, true, 0, ack, ack + crate::TRANSFER_SILENT_MS), true, "刚好静默到窗口边界");
+        assert_eq!(crate::transfer_live(true, true, 0, ack, ack + crate::TRANSFER_SILENT_MS + 1), false, "静默超窗口 = 死了");
+        // 从来没有任何进展（apply_ready 没跑到）→ 不活跃。
+        assert_eq!(crate::transfer_live(true, true, 0, 0, ack), false);
     }
 }

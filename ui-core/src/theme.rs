@@ -1,10 +1,10 @@
 //! 设计 token。
 //!
-//! 三件事：石墨灰的实色层级、文字层次、按钮几何。
+//! 三件事：带粉调的深色层级、文字层次、按钮几何。
 //!
-//! **这一版的主色**：面板走中性石墨灰（带一点点暖），品牌粉
-//! （`ACCENT` / `ACCENT_DEEP`）**只留给主操作与关键数字**，不再到处上色 ——
-//! 上一版灰蓝底 + 满屏彩色徽章，看久了像「仪表盘」而不是「工具」。
+//! **这一版的主色**：v2 重构把面板从石墨灰换成**带粉调的深色**（蔷薇夜色），
+//! 品牌粉不再只是点缀 —— 面板色阶、描边、进度条都往品牌粉靠，
+//! 传输任务卡是全界面唯一抬亮的卡片，和「这是一只传输工具」的定位一致。
 //!
 //! **能生效的只有类型化方法**：真机实测 `prop()` 逃生舱对 `background` /
 //! `background-image` / `box-shadow` 全是空操作，只有 `bg()` / `radius()` /
@@ -27,17 +27,18 @@
 //
 // 层次只靠**实色深浅**做，不靠描边堆：一级面板给一层极淡的描边帮助在彩色壁纸上
 // 划出边界，二级块（列表行、内嵌小块）**不描边**，只靠比一级面板亮一点点的底色分开。
+// v2：三档全部带粉调（红分量 > 蓝分量 > 绿分量），与品牌粉同一家族。
 
 /// 一级面板（页面卡片、区块卡片）。
-pub const SURFACE: &str = "#191B1F";
+pub const SURFACE: &str = "#201721";
 /// 二级块（卡片内的列表行、嵌套小块）。
-pub const SURFACE_SOFT: &str = "#22252A";
+pub const SURFACE_SOFT: &str = "#2B1F2C";
 /// 三级块（悬停 / 选中 / 需要再抬一层的块）。
-pub const SURFACE_STRONG: &str = "#2B2F35";
+pub const SURFACE_STRONG: &str = "#38283A";
 /// 一级面板的描边：只用来在彩色壁纸上划边界，淡到几乎看不见。
-pub const STROKE: &str = "rgba(255,255,255,0.07)";
+pub const STROKE: &str = "rgba(240,140,180,0.12)";
 /// 更弱的描边（内层划分、分隔线）。
-pub const STROKE_SOFT: &str = "rgba(255,255,255,0.045)";
+pub const STROKE_SOFT: &str = "rgba(240,140,180,0.07)";
 
 // ---- 文字 ----
 //
@@ -63,16 +64,24 @@ pub const INFO_BG: &str = "rgba(160,170,185,0.14)";
 
 // ---- 品牌与线路色 ----
 //
-// 品牌粉只用于**主操作按钮**和**关键数字**（进度百分比、总阅读时长）。
+// 品牌粉用在**主操作按钮、关键数字**（进度百分比、总阅读时长）和传输任务卡上。
 // 线路色只用于章节行的序号砖，别的地方不上色。
 
-/// 游戏图标的主粉色。
-pub const ACCENT: &str = "#E4739F";
+/// 游戏图标的主粉色（v2 提亮一档）。
+pub const ACCENT: &str = "#F27BA8";
 /// 主操作按钮底色（比 `ACCENT` 深一档，白字才压得住）。
-pub const ACCENT_DEEP: &str = "#C2557F";
+pub const ACCENT_DEEP: &str = "#CB4B82";
 /// 进度条填充的亮端。
-pub const ACCENT_LIGHT: &str = "#F08CB4";
-pub const TRACK: &str = "rgba(255,255,255,0.09)";
+pub const ACCENT_LIGHT: &str = "#FF9CC4";
+pub const TRACK: &str = "rgba(255,255,255,0.10)";
+
+/// 传输任务卡（每页顶部的 hero 卡）：底色比一级面板粉一档、描边亮粉。
+/// 它是全界面唯一「主动喊你看」的卡片 —— 传输是这只插件的头等大事。
+pub const TRANSFER_BG: &str = "#2E1823";
+pub const TRANSFER_STROKE: &str = "rgba(242,123,168,0.42)";
+/// 断点待续态（上次没传完）：底色与描边转暖黄警示。
+pub const TRANSFER_HELD_BG: &str = "#2E2416";
+pub const TRANSFER_HELD_STROKE: &str = "rgba(232,180,74,0.45)";
 
 /// 线路配色：共通线 / 千岁 / 玲 / 结灯 / 番外。
 pub const LINE_COMMON: &str = "#8FA3BF";
@@ -145,13 +154,13 @@ pub const BUTTON_RADIUS: u32 = BUTTON_HEIGHT / 2;
 pub const BUTTON_PAD_Y: u32 = 13;
 
 /// 主按钮：品牌粉实底 + 白字。**全界面只有主操作用它**。
-pub const BUTTON_PRIMARY: &str = "#C2557F";
-pub const BUTTON_PRIMARY_PRESSED: &str = "#A8456A";
+pub const BUTTON_PRIMARY: &str = "#CB4B82";
+pub const BUTTON_PRIMARY_PRESSED: &str = "#A83A69";
 pub const BUTTON_PRIMARY_TEXT: &str = "#FFFFFF";
-/// 次要按钮：石墨实底 + 浅字。
-pub const BUTTON_GHOST: &str = "#262A30";
-pub const BUTTON_GHOST_PRESSED: &str = "#32373E";
-pub const BUTTON_GHOST_TEXT: &str = "#E7E9EC";
+/// 次要按钮：带粉调的深实底 + 浅字。
+pub const BUTTON_GHOST: &str = "#33252E";
+pub const BUTTON_GHOST_PRESSED: &str = "#42303B";
+pub const BUTTON_GHOST_TEXT: &str = "#F2E7ED";
 /// 危险按钮：压暗的红实底 + 白字。
 pub const BUTTON_DANGER: &str = "#B4463C";
 pub const BUTTON_DANGER_PRESSED: &str = "#943A32";

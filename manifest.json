@@ -1,7 +1,7 @@
 {
   "name": "甜蜜女友2导入器",
   "icon": "icon.png",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "description": "把《甜蜜女友2》的章节图片同步到手环，并管理存档与阅读统计",
   "author": "其核",
   "website": "https://miband.qihe0507.top/",
@@ -22,16 +22,6 @@
     "packs/p03.pack",
     "packs/p04.pack",
     "packs/p05.pack",
-    "packs/p06.pack",
-    "packs/p07.pack",
-    "packs/p08.pack",
-    "packs/p09.pack",
-    "packs/p10.pack",
-    "packs/p11.pack",
-    "packs/p12.pack",
-    "packs/p13.pack",
-    "packs/p14.pack",
-    "packs/p15.pack",
     "packs/index.json"
   ]
 }

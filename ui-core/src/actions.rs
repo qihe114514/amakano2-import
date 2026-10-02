@@ -10,6 +10,11 @@ use super::theme::LINES;
 pub const CONNECT: &str = "connect";
 pub const LAUNCH: &str = "launch";
 pub const SYNC_ALL: &str = "sync-all";
+/// 从手环保留的断点接着传（`state.resume` 指向的那一章）。
+///
+/// 「继续传输」是用户重连后唯一明确的诉求：断点卡片上的主按钮就挂这个动作，
+/// 插件侧把它翻译成对那一章的 `start_embedded_transfer`（内部按字节游标续传）。
+pub const RESUME: &str = "resume";
 pub const REFRESH: &str = "refresh-list";
 pub const CLEAR_CACHE: &str = "clear-cache";
 pub const LOG_CLEAR: &str = "log-clear";
@@ -116,6 +121,8 @@ pub enum Action {
     Launch,
     SyncAll,
     Sync(usize),
+    /// 接着手环上留有断点的那一章（`ResumeView` 指向的章节）。
+    Resume,
     RefreshList,
     ClearCache,
     Delete(String),
@@ -269,6 +276,7 @@ pub fn parse(id: &str) -> Option<Action> {
         CONNECT => Some(Action::Connect),
         LAUNCH => Some(Action::Launch),
         SYNC_ALL => Some(Action::SyncAll),
+        RESUME => Some(Action::Resume),
         REFRESH => Some(Action::RefreshList),
         CLEAR_CACHE => Some(Action::ClearCache),
         LOG_CLEAR => Some(Action::LogClear),
@@ -310,6 +318,7 @@ mod tests {
         assert_eq!(parse(CONNECT), Some(Action::Connect));
         assert_eq!(parse(LAUNCH), Some(Action::Launch));
         assert_eq!(parse(SYNC_ALL), Some(Action::SyncAll));
+        assert_eq!(parse(RESUME), Some(Action::Resume));
         assert_eq!(parse(REFRESH), Some(Action::RefreshList));
         assert_eq!(parse(CLEAR_CACHE), Some(Action::ClearCache));
         assert_eq!(parse(LOG_CLEAR), Some(Action::LogClear));

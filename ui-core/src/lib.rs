@@ -83,11 +83,48 @@ pub fn preview_all(snapshot: &Snapshot) -> String {
     blocked.saves_error.clear();
     blocked.band_version.clear();
     pages.push(json!({ "name": BLOCKED_VIEW_NAME, "tree": build(&blocked).to_json() }));
+    // v2 传输任务卡的另外两态 —— 断点待续（「继续传输」按钮的所在）与断点查询盲区。
+    // 这两张卡就是本轮重构的核心诉求（「重连后没有继续按钮」「断点查询期间一片空白」），
+    // 预览里必须能直接看到，否则又是「装到真机上碰运气」。
+    let mut held = snapshot.clone();
+    held.page = Page::Push;
+    held.transfer = None;
+    held.queue = Vec::new();
+    pages.push(json!({ "name": HELD_VIEW_NAME, "tree": build(&held).to_json() }));
+    let mut checking = snapshot.clone();
+    checking.page = Page::Push;
+    checking.transfer = None;
+    checking.resume = None;
+    checking.resume_checking = true;
+    checking.queue = Vec::new();
+    pages.push(json!({ "name": CHECKING_VIEW_NAME, "tree": build(&checking).to_json() }));
+    // 「手环上是 1.x 旧版游戏」的两页：推送页（卸载重装卡 + 同步入口全部禁用）
+    // 与存档页（同款卡替代「通道不可用」+ 导入禁用）。这张卡只在旧代游戏上出现，
+    // 没有预览就永远只能靠「找一台装着 1.x 的手环」才能看见它长什么样。
+    let mut legacy = snapshot.clone();
+    legacy.page = Page::Push;
+    legacy.transfer = None;
+    legacy.resume = None;
+    legacy.queue = Vec::new();
+    legacy.band_version = "1.6.3".into();
+    legacy.band_game_legacy = true;
+    pages.push(json!({ "name": LEGACY_VIEW_NAME, "tree": build(&legacy).to_json() }));
+    let mut legacy_saves = legacy.clone();
+    legacy_saves.page = Page::Saves;
+    pages.push(json!({ "name": LEGACY_SAVES_VIEW_NAME, "tree": build(&legacy_saves).to_json() }));
     serde_json::to_string_pretty(&json!({ "pages": pages })).unwrap_or_default()
 }
 
 /// 预览文档里那一版「通道不可用」的视图名（截图时靠它定位这一段）。
 pub const BLOCKED_VIEW_NAME: &str = "存档（通道不可用）";
+/// 预览文档里「断点待续」的视图名：传输任务卡的「继续传输」状态。
+pub const HELD_VIEW_NAME: &str = "推送（断点待续）";
+/// 预览文档里「断点查询中」的视图名：重连后断点回包未到的盲区。
+pub const CHECKING_VIEW_NAME: &str = "推送（断点查询中）";
+/// 预览文档里「手环上是 1.x 旧版游戏」的推送页视图名。
+pub const LEGACY_VIEW_NAME: &str = "推送（游戏旧版）";
+/// 预览文档里「手环上是 1.x 旧版游戏」的存档页视图名。
+pub const LEGACY_SAVES_VIEW_NAME: &str = "存档（游戏旧版）";
 
 // ------------------------------------------------------------------ 预览样本
 
@@ -155,9 +192,11 @@ pub fn demo() -> Snapshot {
             resumed: false,
             ready: false,
             started: true,
+            stalled: false,
             chunk_bytes: 8192,
         }),
         resume,
+        resume_checking: false,
         cache_bytes: 462_848,
         cache_files: 17,
         chunk_bytes: 8192,
@@ -177,6 +216,7 @@ pub fn demo() -> Snapshot {
         saves_unsupported: false,
         saves_busy: false,
         band_version: "2.0.0".into(),
+        band_game_legacy: false,
         saves_notice: "已连接手环，存档列表已刷新".into(),
         // 导出那一行：条数就是真机回包里的 3 条，**字节数按真机那份信封算**（见
         // `demo_export_bytes()`）——「约 7 KB」这类话在窄窗下要放得下，得拿真数字量。
@@ -427,14 +467,26 @@ mod tests {
     #[test]
     fn preview_export_has_one_entry_per_page() {
         let document: Value = serde_json::from_str(&preview_all(&demo())).expect("预览 JSON 必须合法");
-        // 四个页面各一条，**外加**末尾那条「存档（通道不可用）」——那张卡只在通道被
-        // 版本卡住时才出现，必须在预览里看得见（用户实机报的就是它）。
-        assert_eq!(document["pages"].as_array().map(Vec::len), Some(Page::ALL.len() + 1));
+        // 四个页面各一条，外加五张**状态视图**：
+        // 「存档（通道不可用）」—— 那张卡只在通道被版本卡住时出现（用户实机报的）；
+        // 「推送（断点待续）」/「推送（断点查询中）」—— 传输任务卡的另外两态，
+        // 「继续传输」按钮与查询盲区提示正是 v2 重构的核心诉求，必须在预览里看得见；
+        // 「推送（游戏旧版）」/「存档（游戏旧版）」—— 1.x 旧代游戏的卸载重装引导，
+        // 只有装着旧版游戏的手环才会出现，没有预览就永远看不到它长什么样。
+        assert_eq!(document["pages"].as_array().map(Vec::len), Some(Page::ALL.len() + 5));
         assert_eq!(document["pages"][0]["name"], "推送");
         assert_eq!(document["pages"][0]["tree"]["tag"], "div");
         let last = &document["pages"][Page::ALL.len()];
         assert_eq!(last["name"], BLOCKED_VIEW_NAME);
         assert_eq!(last["tree"]["tag"], "div");
+        let held = &document["pages"][Page::ALL.len() + 1];
+        assert_eq!(held["name"], HELD_VIEW_NAME);
+        let checking = &document["pages"][Page::ALL.len() + 2];
+        assert_eq!(checking["name"], CHECKING_VIEW_NAME);
+        let legacy = &document["pages"][Page::ALL.len() + 3];
+        assert_eq!(legacy["name"], LEGACY_VIEW_NAME);
+        let legacy_saves = &document["pages"][Page::ALL.len() + 4];
+        assert_eq!(legacy_saves["name"], LEGACY_SAVES_VIEW_NAME);
     }
 
     #[test]
@@ -466,6 +518,11 @@ mod tests {
         for pack in &snapshot.library {
             assert!(!pack.id.is_empty(), "第 {} 章缺少 id", pack.number);
             assert!(!pack.title.is_empty(), "第 {} 章缺少标题", pack.number);
+            if pack.number == 0 {
+                // 公共资源包不是可读章节：没有时长/幕数/句数（索引里就是 0），只校验体积。
+                assert!(pack.bytes > 0, "{} 的体积不合理", pack.title);
+                continue;
+            }
             assert!(pack.minutes > 0 && pack.bytes > 0, "{} 的时长/体积不合理", pack.title);
             assert_ne!(
                 crate::theme::chapter_line(&pack.title).0,

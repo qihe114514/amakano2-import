@@ -26,7 +26,10 @@ pub fn render(snapshot: &Snapshot) -> Node {
     if let Some(error) = snapshot.error.as_ref() {
         page = page.child(error_card(error));
     }
-    page.child(summary(snapshot))
+    // 1.x 旧代判定就紧跟在失败卡后面：它比下面所有内容都优先 —— 同步入口已经被禁用，
+    // 用户得先知道「为什么按钮都点不动」。
+    page.child(legacy_notice(snapshot))
+        .child(summary(snapshot))
         .child(filters(snapshot))
         .child(chapter_list(snapshot))
         .child(broken_notice(snapshot))
@@ -47,7 +50,7 @@ fn summary(snapshot: &Snapshot) -> Node {
 
     let pending = snapshot.pending_count();
     card = card.child(meta(format!(
-        "共 {} 章 · 约 {} 小时 · {} · 已装 {}/{}",
+        "共 {} 章 · 阅读时长约 {} 小时 · {} · 已装 {}/{}",
         snapshot.library.len(),
         snapshot.total_hours(),
         human_bytes(snapshot.library_bytes()),
@@ -62,7 +65,13 @@ fn summary(snapshot: &Snapshot) -> Node {
     card.child(primary_button(
         &format!("同步剩余 {pending} 章"),
         actions::SYNC_ALL,
-        pending > 0 && !snapshot.is_transferring() && snapshot.device.connected && snapshot.device.alive,
+        pending > 0
+            && !snapshot.is_transferring()
+            && snapshot.device.connected
+            && snapshot.device.alive
+            // 1.x 旧代游戏读不了 2.0 的章节包：同步入口（含下面每章的「同步」）整体禁用，
+            // 原因由最上面的 legacy_notice 卡说，按钮只负责不可点。
+            && !snapshot.band_game_legacy,
         snapshot,
     ))
 }
@@ -114,6 +123,9 @@ fn chapter_list(snapshot: &Snapshot) -> Node {
 /// 唯一允许变窄的东西；行内按钮 `shrink(0)`；行内 `gap` 用 `GAP`(12)。
 fn chapter_row(snapshot: &Snapshot, pack: &PackView) -> Node {
     let (_, line_color) = chapter_line(&pack.title);
+    // 手环断点指向的这一章：按钮从「同步/重传」换成「继续」，行描边用品牌粉挑出来 ——
+    // 重连后用户要找的就是这一行（「重新连接手表后没有继续按钮」的原话诉求）。
+    let is_resume = snapshot.resume_pack_number() == Some(pack.number);
 
     let number_tile = Node::new(Tag::Div)
         .w(36)
@@ -133,6 +145,8 @@ fn chapter_row(snapshot: &Snapshot, pack: &PackView) -> Node {
         .child(label(&pack.title, SIZE_BODY, TEXT_MAIN).weight(600));
     if pack.active {
         title_row = title_row.child(state_badge("同步中", StatusKind::Warn));
+    } else if is_resume {
+        title_row = title_row.child(state_badge("待续传", StatusKind::Warn));
     } else if pack.installed {
         title_row = title_row.child(state_badge("已装", StatusKind::Good));
     } else if pack.queued {
@@ -147,18 +161,22 @@ fn chapter_row(snapshot: &Snapshot, pack: &PackView) -> Node {
         .child(title_row)
         .child(meta(pack.meta_line()));
 
+    // 1.x 旧代：单章同步/继续一并禁用（原因由 legacy_notice 卡说）。
+    let sync_enabled = !snapshot.is_transferring() && !snapshot.band_game_legacy;
     let action = if pack.active {
         state_badge("传输中", StatusKind::Warn)
+    } else if is_resume {
+        accent_chip("继续", &actions::sync_id(pack.number), sync_enabled, snapshot)
     } else {
         accent_chip(
             if pack.installed { "重传" } else { "同步" },
             &actions::sync_id(pack.number),
-            !snapshot.is_transferring(),
+            sync_enabled,
             snapshot,
         )
     };
 
-    let active = pack.active;
+    let active = pack.active || is_resume;
     // ⚠️ **这一行不许挂 hover**：宿主 `ui-v3` 的 `render` 是**整段替换视图**，行上的
     // `on.enter/on.leave` 会在滚动时（指针下方的行随滚动变化）触发重渲染，把章节列表的
     // 滚动位置打回顶部 —— 行高亮不值得用「滚动位置丢失」去换。列表行一律静态底色。
@@ -207,6 +225,37 @@ fn broken_notice(snapshot: &Snapshot) -> Node {
             SIZE_SMALL,
             TEXT_DIM,
         ))
+}
+
+/// 手环上的游戏是 1.x 旧代：**卸载重装**引导卡。
+///
+/// 排在失败卡之后、章节库之前：同步入口（批量/单章/断点续传）此时都已禁用，
+/// 这张卡负责回答「为什么点不动」与「接下来怎么办」。结论与办法各只有一句，
+/// 都从 `Snapshot::band_game_legacy_hint` / `_action` 取 —— 判定在插件侧，
+/// 文案只住这一处，别在状态行或别的页面再手写第二遍。
+fn legacy_notice(snapshot: &Snapshot) -> Node {
+    if !snapshot.band_game_legacy {
+        return Node::new(Tag::Div).full().column();
+    }
+    Node::new(Tag::Div)
+        .full()
+        .column()
+        .gap(GAP_XS)
+        .pad(GAP)
+        .radius(ROW_RADIUS)
+        .bg(SURFACE_SOFT)
+        .border(1, &alpha(BAD, "55"))
+        .child(
+            Node::new(Tag::Div)
+                .full()
+                .row()
+                .align("center")
+                .gap(GAP_XS)
+                .child(state_badge("游戏版本过旧", StatusKind::Bad))
+                .child(Node::new(Tag::Div).grow(1.0)),
+        )
+        .child(label(snapshot.band_game_legacy_hint(), SIZE_SMALL, TEXT_SUB))
+        .child(label(snapshot.band_game_legacy_action(), SIZE_SMALL, TEXT_DIM))
 }
 
 /// 手环上已安装的章节（+ 刷新入口 + 旧版本残留说明）。
@@ -373,5 +422,50 @@ mod tests {
         let tree = render(&demo());
         assert!(tree.find(|node| node.get("on.click") == Some("connect")).is_empty(), "连接按钮在任务条");
         assert!(tree.find(|node| node.get("on.click") == Some("launch")).is_empty(), "打开游戏按钮在任务条");
+    }
+
+    /// 手环上是 1.x 旧版游戏：卸载重装卡必须出现并说清「为什么、怎么办」，
+    /// 所有同步入口（批量 + 每章 + 继续）一并禁用。
+    #[test]
+    fn legacy_game_shows_the_reinstall_card_and_disables_every_sync_entry() {
+        let mut snapshot = demo();
+        // 夹具默认「传输中」，那本身就会禁用同步按钮 —— 置空后才能看清 legacy 的独立作用。
+        snapshot.transfer = None;
+        snapshot.band_game_legacy = true;
+        snapshot.band_version = "1.6.3".into();
+        let tree = render(&snapshot);
+        let texts = tree.texts().join(" | ");
+        assert!(texts.contains("游戏版本过旧"), "{texts}");
+        assert!(texts.contains("1.x 旧版（v1.6.3）"), "版本号要说出来：{texts}");
+        assert!(texts.contains("卸载"), "{texts}");
+        // 批量同步 + 每章同步/继续：全部不可点（禁用按钮不挂 on.click）。
+        assert!(tree.find(|node| node.get("on.click") == Some(actions::SYNC_ALL)).is_empty());
+        let chips: Vec<_> = tree
+            .find(|node| node.text.as_deref().is_some_and(|t| t == "同步" || t == "重传" || t == "继续"));
+        assert!(!chips.is_empty(), "样例里应该有章节行按钮");
+        for chip in &chips {
+            assert_eq!(chip.get("disabled"), Some("1"), "1.x 旧代时章节按钮必须禁用");
+            assert_eq!(chip.get("on.click"), None);
+        }
+    }
+
+    /// 正常 2.x（或还没握手）时这张卡**不许出现**：空卡片在页面顶部留一块白。
+    #[test]
+    fn legacy_card_is_hidden_unless_the_game_is_actually_legacy() {
+        let mut snapshot = demo();
+        // 同上：置空传输，才能验证「非 legacy 时同步按钮是活的」。
+        snapshot.transfer = None;
+        snapshot.band_version = "2.0.0".into();
+        let tree = render(&snapshot);
+        let texts = tree.texts().join(" | ");
+        assert!(!texts.contains("游戏版本过旧"), "{texts}");
+        assert!(!tree.find(|node| node.get("on.click") == Some(actions::SYNC_ALL)).is_empty());
+        let chips = tree.find(|node| {
+            node.text.as_deref().is_some_and(|t| t == "同步" || t == "重传" || t == "继续")
+        });
+        assert!(!chips.is_empty());
+        for chip in &chips {
+            assert_ne!(chip.get("disabled"), Some("1"), "非 legacy 的章节按钮不该禁用");
+        }
     }
 }

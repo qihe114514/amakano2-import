@@ -459,7 +459,14 @@ pub fn badge(value: impl Into<String>, fg: &str, bg: &str) -> Node {
 /// 刻意不用「一个轨道 + 一个百分比宽度的填充」：宿主 `ui-v3` 的 `width` 只收 u32 像素，
 /// 百分比宽度得走 `prop("width","62%")` 这个逃生舱，万一宿主不认就整条塌掉。
 /// 换成「每段 `flex-grow(1)` + 逐段改色」，渲染结果与宿主能力无关，只会粗细不同。
-pub fn segmented_bar(percent: u32, segments: u32, track: &str, colors: &[String]) -> Node {
+/// 条高由调用方指定（传输任务卡的 hero 条 12px，比列表里的 8px 粗一档）。
+pub fn segmented_bar_sized(
+    percent: u32,
+    segments: u32,
+    height: u32,
+    track: &str,
+    colors: &[String],
+) -> Node {
     let segments = segments.max(1);
     let filled = ((percent.min(100) as u64 * segments as u64) / 100) as u32;
     let mut bar = Node::new(Tag::Div).full().row().gap(2);
@@ -475,7 +482,12 @@ pub fn segmented_bar(percent: u32, segments: u32, track: &str, colors: &[String]
             track.to_string()
         };
         bar = bar.child(
-            Node::new(Tag::Div).grow(1.0).h(8).radius(4).bg(&color).transition(crate::theme::TRANSITION),
+            Node::new(Tag::Div)
+                .grow(1.0)
+                .h(height)
+                .radius(height / 2)
+                .bg(&color)
+                .transition(crate::theme::TRANSITION),
         );
     }
     bar
